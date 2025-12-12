@@ -38,6 +38,7 @@ namespace WandererRotator
 	static constexpr bool WR_DEBUG_ENABLED = false; /* Disable debug logging by default */
 	static constexpr bool WR_INFO_ENABLED = false;	/* Enable info logging */
 	static constexpr bool WR_ERROR_ENABLED = true;	/* Enable error logging */
+	static constexpr bool WR_TIMESTAMP_ENABLED = true; /* Enable timestamps in logs */
 
 /* Logging macros - use these throughout the SDK */
 #define WR_DEBUG(fmt, ...)                                   \
@@ -71,6 +72,7 @@ namespace WandererRotator
 	void WRLogDebug(const char *fmt, ...);
 	void WRLogInfo(const char *fmt, ...);
 	void WRLogError(const char *fmt, ...);
+	const char *WRGetTimestamp();
 
 } /* namespace WandererRotator */
 

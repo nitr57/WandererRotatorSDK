@@ -44,6 +44,9 @@ namespace WandererRotator
             return false;
         }
 
+        // 100 ms delay
+        usleep(100000);
+
         WR_DEBUG("SendCommand: Writing '%s'", command);
         if (!device->port->Write((const unsigned char *)command, strlen(command)))
         {
@@ -105,6 +108,7 @@ namespace WandererRotator
     {
         if (!device || !device->port)
         {
+            WR_DEBUG("QueryStatus: invalid device");
             return false;
         }
 
@@ -116,8 +120,8 @@ namespace WandererRotator
             return false;
         }
 
-        // 50 ms delay
-        usleep(50000);
+        // 100 ms delay
+        usleep(100000);
 
         char response[32];
 
@@ -134,6 +138,7 @@ namespace WandererRotator
             char model[8];
             if (sscanf(response, "WandererRotator%7[^A]A", model) != 1)
             {
+                WR_DEBUG("QueryStatus: invalid message %s", response);
                 return false;
             }
 
@@ -141,6 +146,7 @@ namespace WandererRotator
         }
         else
         {
+            WR_DEBUG("QueryStatus: timeout reading model from serial");
             return false;
         }
 
@@ -149,11 +155,13 @@ namespace WandererRotator
         {
             if (sscanf(response, "%dA", &device->firmwareVersion) != 1)
             {
+                WR_DEBUG("QueryStatus: invalid message %s", response);
                 return false;
             }
         }
         else
         {
+            WR_DEBUG("QueryStatus: timeout reading firmware from serial");
             return false;
         }
 
@@ -162,11 +170,13 @@ namespace WandererRotator
         {
             if (sscanf(response, "%dA", &device->mechanicalAngle) != 1)
             {
+                WR_DEBUG("QueryStatus: invalid message %s", response);
                 return false;
             }
         }
         else
         {
+            WR_DEBUG("QueryStatus: timeout reading position from serial");
             return false;
         }
 
@@ -176,12 +186,14 @@ namespace WandererRotator
             float backlash;
             if (sscanf(response, "%fA", &backlash) != 1)
             {
+                WR_DEBUG("QueryStatus: invalid message %s", response);
                 return false;
             }
             device->backlash = backlash * 10.0f;
         }
         else
         {
+            WR_DEBUG("QueryStatus: timeout reading backlash from serial");
             return false;
         }
 
@@ -190,11 +202,13 @@ namespace WandererRotator
         {
             if (sscanf(response, "%dA", &device->reverseDirection) != 1)
             {
+                WR_DEBUG("QueryStatus: invalid message %s", response);
                 return false;
             }
         }
         else
         {
+            WR_DEBUG("QueryStatus: timeout reading reverse state from serial");
             return false;
         }
 
@@ -221,7 +235,7 @@ namespace WandererRotator
         /* Set initial position from mechanical angle */
         device->status.position = device->mechanicalAngle / 1000.0f;
 
-        WR_DEBUG("ParseHandshakeResponse: Successfully parsed, model=%s steps=%d",
+        WR_DEBUG("QueryStatus: Successfully parsed, model=%s steps=%d",
                  device->modelType.c_str(), device->stepsPerDegree);
         return true;
     }
@@ -233,7 +247,7 @@ namespace WandererRotator
 
     const char *ReverseDirectionToCommand(int reverse)
     {
-        return reverse ? "1700001" : "1700000";
+        return reverse ? "1700001\n" : "1700000\n";
     }
 
     /* Background listener thread function for movement completion */

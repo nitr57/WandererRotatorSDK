@@ -330,7 +330,7 @@ WRAPI WR_ERROR_TYPE WRRotatorSetConfig(int id, WR_ROTATOR_CONFIG *config)
 		/* Send backlash command: 10*x + 1600000 */
 		int command_value = BacklashToCommand(config->backlash);
 		char cmd[32];
-		snprintf(cmd, sizeof(cmd), "%d", command_value);
+		snprintf(cmd, sizeof(cmd), "%d\n", command_value);
 
 		if (!SendCommand(device, cmd))
 		{
@@ -360,16 +360,7 @@ WRAPI WR_ERROR_TYPE WRRotatorGetStatus(int id, WR_ROTATOR_STATUS *status)
 
 	auto device = it->second;
 
-	/* If currently moving, try to read response with longer timeout to catch completion */
-	if (!device->status.moving)
-	{
-		// We update the status from device
-
-		if (!QueryStatus(device))
-		{
-			return WR_ERROR_COMMUNICATION;
-		}
-	}
+	/* If currently moving, hardware does not support fetching latest status */
 
 	status->position = device->status.position;
 	status->moving = device->status.moving;

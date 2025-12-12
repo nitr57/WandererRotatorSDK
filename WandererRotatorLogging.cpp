@@ -25,6 +25,7 @@
 #include "WandererRotatorLogging.h"
 #include <cstdio>
 #include <cstdarg>
+#include <ctime>
 
 namespace WandererRotator
 {
@@ -32,11 +33,27 @@ namespace WandererRotator
 	 * LOGGING IMPLEMENTATION
 	 * ============================================================================ */
 
+	const char *WRGetTimestamp()
+	{
+		static char timestamp[20];
+		time_t now = time(nullptr);
+		struct tm *timeinfo = localtime(&now);
+		strftime(timestamp, sizeof(timestamp), "%H:%M:%S", timeinfo);
+		return timestamp;
+	}
+
 	void WRLogDebug(const char *fmt, ...)
 	{
 		va_list args;
 		va_start(args, fmt);
-		fprintf(stderr, "[WR_DEBUG] ");
+		if (WandererRotator::WR_TIMESTAMP_ENABLED)
+		{
+			fprintf(stderr, "[%s] [WR_DEBUG] ", WRGetTimestamp());
+		}
+		else
+		{
+			fprintf(stderr, "[WR_DEBUG] ");
+		}
 		vfprintf(stderr, fmt, args);
 		fprintf(stderr, "\n");
 		va_end(args);
@@ -46,7 +63,14 @@ namespace WandererRotator
 	{
 		va_list args;
 		va_start(args, fmt);
-		fprintf(stderr, "[WR_INFO] ");
+		if (WandererRotator::WR_TIMESTAMP_ENABLED)
+		{
+			fprintf(stderr, "[%s] [WR_INFO] ", WRGetTimestamp());
+		}
+		else
+		{
+			fprintf(stderr, "[WR_INFO] ");
+		}
 		vfprintf(stderr, fmt, args);
 		fprintf(stderr, "\n");
 		va_end(args);
@@ -56,7 +80,14 @@ namespace WandererRotator
 	{
 		va_list args;
 		va_start(args, fmt);
-		fprintf(stderr, "[WR_ERROR] ");
+		if (WandererRotator::WR_TIMESTAMP_ENABLED)
+		{
+			fprintf(stderr, "[%s] [WR_ERROR] ", WRGetTimestamp());
+		}
+		else
+		{
+			fprintf(stderr, "[WR_ERROR] ");
+		}
 		vfprintf(stderr, fmt, args);
 		fprintf(stderr, "\n");
 		va_end(args);

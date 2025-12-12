@@ -296,7 +296,56 @@ namespace WandererRotator
                 return;
             }
             device->status.position = device->mechanicalAngle / 1000.0f; /* Convert from *1000 format to degrees */
-            device->status.moving = 0;
+
+            /* Check if we need to perform second phase of overshoot compensation */
+            if (device->overshooting == 1)
+            {
+                device->overshooting = 2; /* Mark that first phase is done, ready for return */
+                /* Keep moving = 1 since we have a second phase to do */
+
+                WR_INFO("Backlash compensation: returning from overshoot by %.2f degrees", device->overshootAngle);
+
+                /* Small delay before returning */
+                usleep(100000);
+
+                /* Move back by the overshoot amount to land on the actual target */
+                float returnAngle = (device->targetAngle > 0.0f) ? -device->overshootAngle : device->overshootAngle;
+                int command_value = 1000000 + (int)(returnAngle * device->stepsPerDegree);
+                char cmd[16];
+                snprintf(cmd, sizeof(cmd), "%d", command_value);
+
+                WR_DEBUG("Return move command: %s", cmd);
+
+                tcflush(device->port->GetFD(), TCIFLUSH); /* Flush input buffer */
+
+                if (SendCommand(device, cmd))
+                {
+                    device->status.moving = 1;
+
+                    /* Recursively call this function to handle the return movement */
+                    device->listenerRunning = false; /* Will be reset by StartMoveListener */
+                    StartMoveListener(device);
+                    return;
+                }
+                else
+                {
+                    WR_ERROR("Failed to send return movement command");
+                    device->overshooting = 0;
+                    device->status.moving = 0;
+                }
+            }
+            else if (device->overshooting == 2)
+            {
+                /* Second phase complete */
+                device->overshooting = 0;
+                device->status.moving = 0;
+                WR_INFO("Backlash compensation complete, at target %.2f degrees", device->targetAngle);
+            }
+            else
+            {
+                /* No overshoot, just regular movement complete */
+                device->status.moving = 0;
+            }
         }
         else
         {

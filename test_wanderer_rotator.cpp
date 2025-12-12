@@ -135,6 +135,9 @@ int main(int argc, char *argv[])
 		printf("Firmware: %u\n", version.firmware);
 		printf("Backlash: %.2f°\n", config.backlash);
 		printf("Reverse: %s\n", config.reverseDirection ? "Yes" : "No");
+		printf("Overshoot: %s\n", config.overshoot ? "Yes" : "No");
+		printf("Overshoot Angle: %.2f°\n", config.overshootAngle);
+		printf("Overshoot Direction: %s\n", config.overshotDirection ? "CW" : "CCW");
 		printf("Position: %.2f°\n", status.position);
 		printf("Moving: %s\n", status.moving ? "Yes" : "No");
 		printf("Steps per revolution: %d\n", status.stepsPerRevolution);
@@ -159,6 +162,9 @@ int main(int argc, char *argv[])
 		printf("g           - Get current status\n");
 		printf("d           - Toggle reverse direction (currently %s)\n", config.reverseDirection ? "ON" : "OFF");
 		printf("b <angle>   - Set backlash in degrees\n");
+		printf("o <angle>   - Set overshoot angle in degrees\n");
+		printf("t           - Toggle overshoot enable (currently %s)\n", config.overshoot ? "ON" : "OFF");
+		printf("c           - Toggle overshoot direction (currently %s)\n", config.overshotDirection ? "CW" : "CCW");
 		printf("q           - Quit\n");
 		printf("> ");
 		fflush(stdout);
@@ -184,6 +190,15 @@ int main(int argc, char *argv[])
 			if (sscanf(input, "%c %f", &cmd, &angle) != 2)
 			{
 				printf("[FAIL] Invalid format. Use: %c <angle>\n", input[0]);
+				continue;
+			}
+		}
+
+		if (cmd == 'o')
+		{
+			if (sscanf(input, "%c %f", &cmd, &angle) != 2)
+			{
+				printf("[FAIL] Invalid format. Use: o <angle>\n");
 				continue;
 			}
 		}
@@ -275,6 +290,9 @@ int main(int argc, char *argv[])
 				printf("Moving: %s\n", status.moving ? "Yes" : "No");
 				printf("Backlash: %.2f°\n", currentConfig.backlash);
 				printf("Reverse: %s\n", currentConfig.reverseDirection ? "Yes" : "No");
+				printf("Overshoot: %s\n", currentConfig.overshoot ? "Yes" : "No");
+				printf("Overshoot Angle: %.2f°\n", currentConfig.overshootAngle);
+				printf("Overshoot Direction: %s\n", currentConfig.overshotDirection ? "CW" : "CCW");
 				printf("Steps per revolution: %d\n", status.stepsPerRevolution);
 				printf("Step size: %.4f°/step\n", status.stepSize);
 			}
@@ -330,6 +348,80 @@ int main(int argc, char *argv[])
 			else
 			{
 				printf("[OK] Backlash set to %.2f°\n", angle);
+			}
+			break;
+		}
+		case 'o':
+		{
+			/* Set overshoot angle */
+			if (angle < 0.0f)
+			{
+				printf("[FAIL] Overshoot angle must be >= 0\n");
+				break;
+			}
+			printf("Setting overshoot angle to %.2f°...\n", angle);
+			WR_ROTATOR_CONFIG config;
+			config.overshootAngle = angle;
+			config.mask = MASK_ROTATOR_OVERSHOOT_ANGLE;
+
+			result = WRRotatorSetConfig(deviceId, &config);
+			if (result != WR_SUCCESS)
+			{
+				printf("[FAIL] Failed to set overshoot angle (Error: %d)\n", result);
+			}
+			else
+			{
+				printf("[OK] Overshoot angle set to %.2f°\n", angle);
+			}
+			break;
+		}
+		case 't':
+		{
+			/* Toggle overshoot enable */
+			WR_ROTATOR_CONFIG config;
+			result = WRRotatorGetConfig(deviceId, &config);
+			if (result != WR_SUCCESS)
+			{
+				printf("[FAIL] Failed to get config (Error: %d)\n", result);
+				break;
+			}
+
+			config.overshoot = !config.overshoot;
+			config.mask = MASK_ROTATOR_OVERSHOOT;
+
+			result = WRRotatorSetConfig(deviceId, &config);
+			if (result != WR_SUCCESS)
+			{
+				printf("[FAIL] Failed to toggle overshoot (Error: %d)\n", result);
+			}
+			else
+			{
+				printf("[OK] Overshoot toggled to: %s\n", config.overshoot ? "ON" : "OFF");
+			}
+			break;
+		}
+		case 'c':
+		{
+			/* Toggle overshoot direction */
+			WR_ROTATOR_CONFIG config;
+			result = WRRotatorGetConfig(deviceId, &config);
+			if (result != WR_SUCCESS)
+			{
+				printf("[FAIL] Failed to get config (Error: %d)\n", result);
+				break;
+			}
+
+			config.overshotDirection = !config.overshotDirection;
+			config.mask = MASK_ROTATOR_OVERSHOOT_DIRECTION;
+
+			result = WRRotatorSetConfig(deviceId, &config);
+			if (result != WR_SUCCESS)
+			{
+				printf("[FAIL] Failed to set overshoot direction (Error: %d)\n", result);
+			}
+			else
+			{
+				printf("[OK] Overshoot direction set to: %s\n", config.overshotDirection ? "CW" : "CCW");
 			}
 			break;
 		}

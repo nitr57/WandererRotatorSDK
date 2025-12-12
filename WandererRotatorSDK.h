@@ -50,9 +50,12 @@ typedef enum _WR_ERROR_TYPE {
 /*
  * Used by WRxxxSetConfig() to indicate which field wants to be set
  */
-#define MASK_ROTATOR_REVERSE_DIRECTION      1 << 0
-#define MASK_ROTATOR_BACKLASH               1 << 1
-#define MASK_ROTATOR_ALL                    1 << 8
+#define MASK_ROTATOR_REVERSE_DIRECTION          1 << 0
+#define MASK_ROTATOR_BACKLASH                   1 << 1
+#define MASK_ROTATOR_OVERSHOOT                  1 << 2
+#define MASK_ROTATOR_OVERSHOOT_ANGLE            1 << 3
+#define MASK_ROTATOR_OVERSHOOT_DIRECTION        1 << 4
+#define MASK_ROTATOR_ALL                        1 << 8
 
 typedef struct _WR_VERSION
 {
@@ -62,9 +65,12 @@ typedef struct _WR_VERSION
 
 typedef struct _WR_ROTATOR_CONFIG
 {
-	unsigned int mask;                  /* Used by WRRotatorSetConfig() to indicate which field wants to be set */
-	int reverseDirection;               /* 0 - Not reverse motor moving direction, others - Reverse motor moving direction */
-	float backlash;                     /* Backlash in degrees */
+	unsigned int mask;          /* Used by WRRotatorSetConfig() to indicate which field wants to be set */
+	int reverseDirection;       /* 0 - Not reverse motor moving direction, others - Reverse motor moving direction */
+	float backlash;             /* Backlash in degrees */
+	int overshoot;            	/* Backlash overshoot: 0 - disabled, others - enabled */
+	float overshootAngle;    	/* Backlash overshoot angle in degrees(move past target, then return) */
+	int overshotDirection; 		/* Backlash overshoot direction: 0 - normal, others - reverse */
 } WR_ROTATOR_CONFIG;
 
 typedef struct _WR_ROTATOR_STATUS {

@@ -48,8 +48,12 @@ namespace WandererRotator
 		int backlash = 0;
 		int reverseDirection = 0;
 		int stepsPerDegree = 0;
-		float targetAngle = 0.0f;
 		float lastRotated = 0.0f;
+		int overshoot = 0;
+		float overshootAngle = 0.0f; /* Backlash overshoot angle in degrees */
+		int overshotDirection = 0;	 /* 0 - normal, 1 - reverse */
+		int overshooting = 0;		 /* 0 - not in overshoot, 1 - in first phase, 2 - awaiting return */
+		float targetAngle = 0.0f;	 /* Target angle for second phase of overshoot */
 
 		struct RotatorConfig
 		{

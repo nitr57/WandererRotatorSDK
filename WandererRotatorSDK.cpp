@@ -52,6 +52,83 @@
 using namespace WandererRotator;
 
 /* ============================================================================
+ * HELPER FUNCTIONS
+ * ============================================================================ */
+
+static WR_ERROR_TYPE MoveInternal(std::shared_ptr<Device> device, float angle)
+{
+	/* Check if overshoot applies for this movement
+	 * Overshoot is only applied in one direction based on overshotDirection flag
+	 * overshotDirection: 0 = apply overshoot for positive angles (CCW)
+	 *                    1 = apply overshoot for negative angles (CW)
+	 */
+	int shouldApplyOvershoot = 0;
+	if (device->overshoot && device->overshootAngle > 0.0f)
+	{
+		if ((device->overshotDirection == 0 && angle > 0.0f) ||
+		    (device->overshotDirection == 1 && angle < 0.0f))
+		{
+			shouldApplyOvershoot = 1;
+		}
+	}
+
+	/* Phase 1: Move to the desired angle (+ overshoot if applicable) */
+	float moveAngle = angle;
+	if (shouldApplyOvershoot)
+	{
+		/* Add overshoot in the direction of movement */
+		if (angle > 0.0f)
+		{
+			moveAngle = angle + device->overshootAngle;
+		}
+		else
+		{
+			moveAngle = angle - device->overshootAngle;
+		}
+		WR_INFO("Applying overshoot: moving to %.2f (target: %.2f, overshoot: %.2f)", 
+		        moveAngle, angle, device->overshootAngle);
+
+		/* Mark that we're in overshoot mode - waiting for first phase to complete */
+		device->overshooting = 1;
+		device->targetAngle = angle;
+	}
+	else
+	{
+		/* Ensure overshoot flag is cleared if not applying */
+		device->overshooting = 0;
+	}
+
+	/* Relative movement by angle in degrees
+	 * Positive angle = counterclockwise
+	 * Negative angle = clockwise
+	 * Command: 1000000 + (angle * stepsPerDegree)
+	 */
+	int command_value = 1000000 + (int)(moveAngle * device->stepsPerDegree);
+	char cmd[8];
+	snprintf(cmd, sizeof(cmd), "%d", command_value);
+
+	WR_DEBUG("MoveInternal: angle=%.2f, command=%s", moveAngle, cmd);
+
+	/* Drain any leftover data in the buffer before sending move command */
+	usleep(50000);
+	tcflush(device->port->GetFD(), TCIFLUSH); /* Flush input buffer */
+
+	if (!SendCommand(device, cmd))
+	{
+		device->overshooting = 0;
+		return WR_ERROR_COMMUNICATION;
+	}
+
+	/* Mark device as moving - status will be updated when response arrives */
+	device->status.moving = 1;
+
+	/* Listener will get the rotation feedback */
+	StartMoveListener(device);
+
+	return WR_SUCCESS;
+}
+
+/* ============================================================================
  * PUBLIC SDK API IMPLEMENTATION
  * ============================================================================ */
 
@@ -288,6 +365,9 @@ WRAPI WR_ERROR_TYPE WRRotatorGetConfig(int id, WR_ROTATOR_CONFIG *config)
 	auto device = it->second;
 	config->reverseDirection = device->rotator.reverseDirection;
 	config->backlash = device->backlash / 10.0f; /* Convert from internal format */
+	config->overshoot = device->overshoot;
+	config->overshootAngle = device->overshootAngle;
+	config->overshotDirection = device->overshotDirection;
 
 	return WR_SUCCESS;
 }
@@ -338,6 +418,34 @@ WRAPI WR_ERROR_TYPE WRRotatorSetConfig(int id, WR_ROTATOR_CONFIG *config)
 		}
 
 		device->backlash = (int)(config->backlash * 10.0f);
+	}
+
+	if (config->mask & MASK_ROTATOR_OVERSHOOT)
+	{
+		device->overshoot = config->overshoot != 0;
+		WR_DEBUG("Set overshoot to %d", config->overshoot);
+	}
+
+	if (config->mask & MASK_ROTATOR_OVERSHOOT_ANGLE)
+	{
+		if (config->overshootAngle < 0.0f)
+		{
+			return WR_ERROR_INVALID_PARAMETER;
+		}
+
+		device->overshootAngle = config->overshootAngle;
+		WR_DEBUG("Set backlash overshoot to %.2f degrees", config->overshootAngle);
+	}
+
+	if (config->mask & MASK_ROTATOR_OVERSHOOT_DIRECTION)
+	{
+		if (config->overshotDirection < 0)
+		{
+			return WR_ERROR_INVALID_PARAMETER;
+		}
+
+		device->overshotDirection = config->overshotDirection != 0;
+		WR_DEBUG("Set backlash overshoot direction to %d", device->overshotDirection);
 	}
 
 	return WR_SUCCESS;
@@ -457,91 +565,57 @@ WRAPI WR_ERROR_TYPE WRRotatorMove(int id, float angle)
 		return WR_ERROR_COMMUNICATION;
 	}
 
-	/* Relative movement by angle in degrees
-	 * Positive angle = counterclockwise
-	 * Negative angle = clockwise
-	 * Command: 1000000 + (angle * stepsPerDegree)
-	 */
-
-	int command_value = 1000000 + (int)(angle * device->stepsPerDegree);
-	char cmd[8];
-	snprintf(cmd, sizeof(cmd), "%d", command_value);
-
-	WR_DEBUG("WRRotatorMove: angle=%.2f, command=%s", angle, cmd);
-
-	// Store last target
-	device->targetAngle = angle;
-
-	/* Drain any leftover data in the buffer before sending move command */
-	usleep(50000);
-	tcflush(device->port->GetFD(), TCIFLUSH); /* Flush input buffer */
-
-	if (!SendCommand(device, cmd))
-	{
-		return WR_ERROR_COMMUNICATION;
-	}
-
-	/* Mark device as moving - status will be updated when response arrives */
-	device->status.moving = 1;
-
-	/* Listener will get the rotation feedback */
-	StartMoveListener(device);
-
-	return WR_SUCCESS;
+	return MoveInternal(device, angle);
 }
 
 WRAPI WR_ERROR_TYPE WRRotatorMoveTo(int id, float angle)
 {
-	float delta;
+	std::lock_guard<std::mutex> lock(g_globalMutex);
 
+	auto it = g_devices.find(id);
+	if (it == g_devices.end())
 	{
-		std::lock_guard<std::mutex> lock(g_globalMutex);
-
-		auto it = g_devices.find(id);
-		if (it == g_devices.end())
-		{
-			return WR_ERROR_INVALID_ID;
-		}
-
-		auto device = it->second;
-
-		if (!device->port || !device->port->IsOpen())
-		{
-			return WR_ERROR_COMMUNICATION;
-		}
-
-		if (angle < 0.0f || angle >= 360.0f)
-		{
-			return WR_ERROR_INVALID_PARAMETER;
-		}
-
-		// Fetch current position
-		if (!QueryStatus(device))
-		{
-			return WR_ERROR_COMMUNICATION;
-		}
-
-		float currentAngle = (float)device->mechanicalAngle / 1000.0f;
-
-		/* Absolute positioning
-		 * Calculate relative movement needed from current position
-		 */
-		delta = angle - currentAngle;
-
-		/* Normalize delta to shortest path */
-		delta = fmodf(delta + 180.0f, 360.0f);
-		delta = (delta < 0.0f) ? delta + 180.0f : delta - 180.0f;
-
-		// Skip 0 delta
-		if (delta == 0.0f)
-		{
-			return WR_SUCCESS;
-		}
-
-		WR_DEBUG("Moving from %f by %f to %f\n", currentAngle, delta, angle);
+		return WR_ERROR_INVALID_ID;
 	}
 
-	return WRRotatorMove(id, delta);
+	auto device = it->second;
+
+	if (!device->port || !device->port->IsOpen())
+	{
+		return WR_ERROR_COMMUNICATION;
+	}
+
+	if (angle < 0.0f || angle >= 360.0f)
+	{
+		return WR_ERROR_INVALID_PARAMETER;
+	}
+
+	// Fetch current position
+	if (!QueryStatus(device))
+	{
+		return WR_ERROR_COMMUNICATION;
+	}
+
+	float currentAngle = (float)device->mechanicalAngle / 1000.0f;
+
+	/* Absolute positioning
+	 * Calculate relative movement needed from current position
+	 */
+	float delta = angle - currentAngle;
+
+	/* Normalize delta to shortest path */
+	delta = fmodf(delta + 180.0f, 360.0f);
+	delta = (delta < 0.0f) ? delta + 180.0f : delta - 180.0f;
+
+	// Skip 0 delta
+	if (delta == 0.0f)
+	{
+		return WR_SUCCESS;
+	}
+
+	WR_DEBUG("Moving from %f by %f to %f\n", currentAngle, delta, angle);
+
+	return MoveInternal(device, delta);
 }
 
 WRAPI WR_ERROR_TYPE WRRotatorStopMove(int id)

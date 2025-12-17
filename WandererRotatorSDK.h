@@ -50,12 +50,12 @@ typedef enum _WR_ERROR_TYPE {
 /*
  * Used by WRxxxSetConfig() to indicate which field wants to be set
  */
-#define MASK_ROTATOR_REVERSE_DIRECTION          1 << 0
-#define MASK_ROTATOR_BACKLASH                   1 << 1
-#define MASK_ROTATOR_OVERSHOOT                  1 << 2
-#define MASK_ROTATOR_OVERSHOOT_ANGLE            1 << 3
-#define MASK_ROTATOR_OVERSHOOT_DIRECTION        1 << 4
-#define MASK_ROTATOR_ALL                        1 << 8
+#define MASK_ROTATOR_REVERSE_DIRECTION          0x01
+#define MASK_ROTATOR_BACKLASH                   0x02
+#define MASK_ROTATOR_OVERSHOOT                  0x04
+#define MASK_ROTATOR_OVERSHOOT_ANGLE            0x08
+#define MASK_ROTATOR_OVERSHOOT_DIRECTION        0x10
+#define MASK_ROTATOR_ALL                        0x1F
 
 typedef struct _WR_VERSION
 {

@@ -23,7 +23,7 @@
 # ###############################################################################
 
 cmake_minimum_required(VERSION 3.22)
-project(WandererRotatorSDK VERSION 1.0.0 DESCRIPTION "Wanderer Rotator SDK for telescope control")
+project(WandererRotatorSDK VERSION 1.1.0 DESCRIPTION "Wanderer Rotator SDK for telescope control")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

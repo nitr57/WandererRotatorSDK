@@ -164,5 +164,5 @@ For issues, questions, or suggestions, please open an issue on the project repos
 
 ---
 
-**Version:** 1.0.0  
+**Version:** 1.1.0  
 **Last Updated:** December 2025

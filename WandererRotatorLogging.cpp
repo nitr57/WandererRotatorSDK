@@ -1,7 +1,7 @@
 /* *******************************************************************************
  * MIT License
  *
- * Copyright (c) 2025 Nico Trost
+ * Copyright (c) 2025-2026 Nico Trost
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -29,68 +29,68 @@
 
 namespace WandererRotator
 {
-	/* ============================================================================
-	 * LOGGING IMPLEMENTATION
-	 * ============================================================================ */
+    /* ============================================================================
+     * LOGGING IMPLEMENTATION
+     * ============================================================================ */
 
-	const char *WRGetTimestamp()
-	{
-		static char timestamp[20];
-		time_t now = time(nullptr);
-		struct tm *timeinfo = localtime(&now);
-		strftime(timestamp, sizeof(timestamp), "%H:%M:%S", timeinfo);
-		return timestamp;
-	}
+    const char *WRGetTimestamp()
+    {
+        static char timestamp[20];
+        time_t now = time(nullptr);
+        struct tm *timeinfo = localtime(&now);
+        strftime(timestamp, sizeof(timestamp), "%H:%M:%S", timeinfo);
+        return timestamp;
+    }
 
-	void WRLogDebug(const char *fmt, ...)
-	{
-		va_list args;
-		va_start(args, fmt);
-		if (WandererRotator::WR_TIMESTAMP_ENABLED)
-		{
-			fprintf(stderr, "[%s] [WR_DEBUG] ", WRGetTimestamp());
-		}
-		else
-		{
-			fprintf(stderr, "[WR_DEBUG] ");
-		}
-		vfprintf(stderr, fmt, args);
-		fprintf(stderr, "\n");
-		va_end(args);
-	}
+    void WRLogDebug(const char *fmt, ...)
+    {
+        va_list args;
+        va_start(args, fmt);
+        if (WandererRotator::WR_TIMESTAMP_ENABLED)
+        {
+            fprintf(stderr, "[%s] [WR_DEBUG] ", WRGetTimestamp());
+        }
+        else
+        {
+            fprintf(stderr, "[WR_DEBUG] ");
+        }
+        vfprintf(stderr, fmt, args);
+        fprintf(stderr, "\n");
+        va_end(args);
+    }
 
-	void WRLogInfo(const char *fmt, ...)
-	{
-		va_list args;
-		va_start(args, fmt);
-		if (WandererRotator::WR_TIMESTAMP_ENABLED)
-		{
-			fprintf(stderr, "[%s] [WR_INFO] ", WRGetTimestamp());
-		}
-		else
-		{
-			fprintf(stderr, "[WR_INFO] ");
-		}
-		vfprintf(stderr, fmt, args);
-		fprintf(stderr, "\n");
-		va_end(args);
-	}
+    void WRLogInfo(const char *fmt, ...)
+    {
+        va_list args;
+        va_start(args, fmt);
+        if (WandererRotator::WR_TIMESTAMP_ENABLED)
+        {
+            fprintf(stderr, "[%s] [WR_INFO] ", WRGetTimestamp());
+        }
+        else
+        {
+            fprintf(stderr, "[WR_INFO] ");
+        }
+        vfprintf(stderr, fmt, args);
+        fprintf(stderr, "\n");
+        va_end(args);
+    }
 
-	void WRLogError(const char *fmt, ...)
-	{
-		va_list args;
-		va_start(args, fmt);
-		if (WandererRotator::WR_TIMESTAMP_ENABLED)
-		{
-			fprintf(stderr, "[%s] [WR_ERROR] ", WRGetTimestamp());
-		}
-		else
-		{
-			fprintf(stderr, "[WR_ERROR] ");
-		}
-		vfprintf(stderr, fmt, args);
-		fprintf(stderr, "\n");
-		va_end(args);
-	}
+    void WRLogError(const char *fmt, ...)
+    {
+        va_list args;
+        va_start(args, fmt);
+        if (WandererRotator::WR_TIMESTAMP_ENABLED)
+        {
+            fprintf(stderr, "[%s] [WR_ERROR] ", WRGetTimestamp());
+        }
+        else
+        {
+            fprintf(stderr, "[WR_ERROR] ");
+        }
+        vfprintf(stderr, fmt, args);
+        fprintf(stderr, "\n");
+        va_end(args);
+    }
 
 } /* namespace WandererRotator */

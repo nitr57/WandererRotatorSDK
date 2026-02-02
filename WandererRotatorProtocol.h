@@ -25,6 +25,7 @@
 #ifndef WANDERER_ROTATOR_PROTOCOL_H
 #define WANDERER_ROTATOR_PROTOCOL_H
 
+#include "WandererRotatorSDK.h"
 #include "WandererRotatorDevice.h"
 
 namespace WandererRotator
@@ -37,9 +38,19 @@ namespace WandererRotator
      * @param timeoutMs Timeout in milliseconds (default 3000ms)
      * @return true if command succeeded
      */
-    bool SendCommand(std::shared_ptr<Device> device, const char *command, int timeoutMs = 3000);
+    WR_ERROR_TYPE SendCommand(std::shared_ptr<Device> device, const char *command, int timeoutMs = 300);
+    WR_ERROR_TYPE SendAndWaitForReply(std::shared_ptr<Device> device, const char* cmd, char* buffer, int maxLen, int sendTimeoutMs = 200, int recvTimeoutMs = 500);
+    WR_ERROR_TYPE SendAndWaitForReplyWithRetry(std::shared_ptr<Device> device,
+                                               const char *cmd,
+                                               char *buffer,
+                                               int maxLen,
+                                               int sendTimeoutMs = 200,
+                                               int recvTimeoutMs = 200,
+                                               int maxRetries = 3,
+                                               int retryDelayMs = 200,
+                                               const char *timeoutMsg = "timeout");
 
-    bool QueryStatus(std::shared_ptr<Device> device);
+    WR_ERROR_TYPE QueryStatus(std::shared_ptr<Device> device);
 
     /**
      * Convert backlash value to command value.
@@ -75,7 +86,6 @@ namespace WandererRotator
      * @param device Device to stop listening on
      */
     void StopMoveListener(std::shared_ptr<Device> device);
-    bool QueryHandshake(std::shared_ptr<Device> device);
 
 } /* namespace WandererRotator */
 

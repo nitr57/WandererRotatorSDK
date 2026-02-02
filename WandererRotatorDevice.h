@@ -33,6 +33,15 @@
 #include <thread>
 #include <atomic>
 
+#define RETURN_IF_ERROR(fct)        \
+    {                               \
+        WR_ERROR_TYPE stat = fct;   \
+        if (stat != WR_SUCCESS)     \
+        {                           \
+            return stat;            \
+        }                           \
+    }
+
 namespace WandererRotator
 {
 	/**

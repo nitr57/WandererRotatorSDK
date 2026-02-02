@@ -1,7 +1,7 @@
 /* *******************************************************************************
  * MIT License
  *
- * Copyright (c) 2025 Nico Trost
+ * Copyright (c) 2025-2026 Nico Trost
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,195 +22,150 @@
  * SOFTWARE.
  * **************************************************************************** */
 
+#include "WandererRotatorSDK.h"
 #include "WandererRotatorProtocol.h"
 #include "WandererRotatorLogging.h"
 #include <cstring>
 #include <cstdio>
-#include <unistd.h>
-#include <termios.h>
-#include <thread>
-#include <atomic>
 #include <memory>
+#include <chrono>
+#include <thread>
 
 namespace WandererRotator
 {
-    bool SendCommand(std::shared_ptr<Device> device, const char *command, int timeoutMs)
+    WR_ERROR_TYPE SendCommand(std::shared_ptr<Device> device, const char *command, int timeoutMs)
     {
-        if (!device || !device->port || !device->port->IsOpen())
+        if (!device)
+        {
+            return WR_ERROR_NULL_POINTER;
+        }
+
+        if (!device->port || !device->port->IsOpen())
         {
             WR_DEBUG("SendCommand: device=%p, port=%p, isOpen=%d",
+                     device.get(), device ? device->port.get() : nullptr,
+                     device && device->port ? device->port->IsOpen() : 0);
+            return WR_ERROR_COMMUNICATION;
+        }
+
+        device->port->Drain();
+        device->port->Flush();
+        device->port->ClearRxBuffer();
+
+        if (!device->port->Write((const unsigned char *)command, strlen(command)))
+        {
+            WR_DEBUG("SendCommand: Write failed");
+            return WR_ERROR_COMMUNICATION;
+        }
+
+        return WR_SUCCESS;
+    }
+
+    int ReadResponse(std::shared_ptr<Device> device, char *response, int maxLen, int timeoutMs)
+    {
+        if(!device || !device->port || !device->port->IsOpen())
+        {
+            WR_DEBUG("ReadResponse: device=%p, port=%p, isOpen=%d",
                      device.get(), device ? device->port.get() : nullptr,
                      device && device->port ? device->port->IsOpen() : 0);
             return false;
         }
 
-        // 100 ms delay
-        usleep(100000);
-
-        WR_DEBUG("SendCommand: Writing '%s'", command);
-        if (!device->port->Write((const unsigned char *)command, strlen(command)))
+        WR_DEBUG("ReadResponse: Reading...");
+        int len = device->port->Read((unsigned char *)response, maxLen, '\r', 500);
+        if(len == 0)
         {
-            WR_DEBUG("SendCommand: Write failed");
-            return false;
+            WR_DEBUG("ReadResponse: Read failed");
+            return 0;
         }
 
-        return true;
+        return len;
     }
 
-    bool QueryHandshake(std::shared_ptr<Device> device)
+    WR_ERROR_TYPE SendAndWaitForReply(std::shared_ptr<Device> device, const char* cmd, char* buffer, int maxLen, int sendTimeoutMs, int recvTimeoutMs)
     {
-        if (!device || !device->port)
+        // Send command
+        RETURN_IF_ERROR(SendCommand(device, cmd, sendTimeoutMs));
+
+        // Read response
+        if (!ReadResponse(device, buffer, maxLen, recvTimeoutMs))
         {
-            return false;
+            WR_DEBUG("Failed to receive response");
+            return WR_ERROR_COMMUNICATION;
         }
 
-        WR_DEBUG("QueryHandshake: started for device %s", device->portName.c_str());
-
-        if (!device->port->IsOpen())
-        {
-            WR_DEBUG("QueryHandshake: Port not open");
-            return false;
-        }
-
-        // 100 ms delay
-        usleep(100000);
-
-        int retries = 0;
-        char response[32];
-
-        while (retries++ < 5)
-        {
-            tcflush(device->port->GetFD(), TCIOFLUSH);
-            if (!device->port->Write((const unsigned char *)"1500001\n", 8))
-            {
-                WR_DEBUG("Handshake: Writing to serial failed");
-                return false;
-            }
-
-            if (device->port->Read((unsigned char *)response, 32, 'A', 3000))
-            {
-                if (strstr(response, "WandererRotator") != NULL)
-                {
-                    printf("Found after %d retries", retries);
-                    return true;
-                }
-            }
-
-            // 200 ms delay
-            usleep(200000);
-        }
-
-        WR_DEBUG("Handshake: Handshaking timed out after %d retries", retries);
-        return false;
+        return WR_SUCCESS;
     }
 
-    bool QueryStatus(std::shared_ptr<Device> device)
+    WR_ERROR_TYPE SendAndWaitForReplyWithRetry(std::shared_ptr<Device> device,
+                                         const char *cmd,
+                                         char* buffer,
+                                         int maxLen,
+                                         int sendTimeoutMs,
+                                         int recvTimeoutMs,
+                                         int maxRetries,
+                                         int retryDelayMs,
+                                         const char *timeoutMsg)
     {
-        if (!device || !device->port)
+        for (int attempt = 1; attempt <= maxRetries; ++attempt)
         {
-            WR_DEBUG("QueryStatus: invalid device");
-            return false;
-        }
+            WR_DEBUG("SendAndWaitForReplyWithRetry: Attempt %d/%d for %s (timeout=%dms)", attempt, maxRetries, timeoutMsg, recvTimeoutMs);
 
-        WR_DEBUG("QueryStatus: started for device %s", device->portName.c_str());
-
-        if (!device->port->IsOpen())
-        {
-            WR_DEBUG("QueryStatus: Port not open");
-            return false;
-        }
-
-        // 100 ms delay
-        usleep(100000);
-
-        char response[32];
-
-        tcflush(device->port->GetFD(), TCIOFLUSH);
-        if (!device->port->Write((const unsigned char *)"1500001\n", 8))
-        {
-            WR_DEBUG("QueryStatus: Writing to serial failed");
-            return false;
-        }
-
-        // Read handshake tag and model
-        if (device->port->Read((unsigned char *)response, 32, 'A', 3000))
-        {
-            char model[8];
-            if (sscanf(response, "WandererRotator%7[^A]A", model) != 1)
+            if (SendAndWaitForReply(device, cmd, buffer, maxLen, sendTimeoutMs, recvTimeoutMs) == WR_SUCCESS)
             {
-                WR_DEBUG("QueryStatus: invalid message %s", response);
-                return false;
+                WR_DEBUG("SendAndWaitForReplyWithRetry: Success on attempt %d for %s", attempt, timeoutMsg);
+                return WR_SUCCESS;
             }
 
-            device->modelType = std::string(model);
-        }
-        else
-        {
-            WR_DEBUG("QueryStatus: timeout reading model from serial");
-            return false;
-        }
-
-        // Read firmware
-        if (device->port->Read((unsigned char *)response, 32, 'A', 3000))
-        {
-            if (sscanf(response, "%dA", &device->firmwareVersion) != 1)
+            if (attempt < maxRetries)
             {
-                WR_DEBUG("QueryStatus: invalid message %s", response);
-                return false;
+                WR_DEBUG("SendAndWaitForReplyWithRetry: Failed on attempt %d, retrying after %d ms", attempt, retryDelayMs);
+                std::this_thread::sleep_for(std::chrono::milliseconds(retryDelayMs));
             }
         }
-        else
+
+        WR_DEBUG("SendAndWaitForReplyWithRetry: All %d attempts failed for %s", maxRetries, timeoutMsg);
+        return WR_ERROR_COMMUNICATION;
+    }
+
+    WR_ERROR_TYPE QueryStatus(std::shared_ptr<Device> device)
+    {
+        if (!device)
         {
-            WR_DEBUG("QueryStatus: timeout reading firmware from serial");
-            return false;
+            return WR_ERROR_NULL_POINTER;
         }
 
-        // Read mechanical position
-        if (device->port->Read((unsigned char *)response, 32, 'A', 3000))
+        if (!device->port || !device->port->IsOpen())
         {
-            if (sscanf(response, "%dA", &device->mechanicalAngle) != 1)
-            {
-                WR_DEBUG("QueryStatus: invalid message %s", response);
-                return false;
-            }
-        }
-        else
-        {
-            WR_DEBUG("QueryStatus: timeout reading position from serial");
-            return false;
+            return WR_ERROR_COMMUNICATION;
         }
 
-        // Read backlash
-        if (device->port->Read((unsigned char *)response, 32, 'A', 3000))
+        char response[64];
+        RETURN_IF_ERROR(SendAndWaitForReply(device, "1500001\n", response, 64));
+
+        WR_INFO("Response: '%s'", response);
+
+        char model[8];
+        int firmware;
+        int angle;
+        float backlash;
+        int reverse;
+        if (sscanf(response,
+                   "WandererRotator%7[^A]A%dA%dA%fA%dA",
+                   model,
+                   &firmware,
+                   &angle,
+                   &backlash,
+                   &reverse) != 5)
         {
-            float backlash;
-            if (sscanf(response, "%fA", &backlash) != 1)
-            {
-                WR_DEBUG("QueryStatus: invalid message %s", response);
-                return false;
-            }
-            device->backlash = backlash * 10.0f;
-        }
-        else
-        {
-            WR_DEBUG("QueryStatus: timeout reading backlash from serial");
-            return false;
+            return WR_ERROR_COMMUNICATION;
         }
 
-        // Read reverse state
-        if (device->port->Read((unsigned char *)response, 32, 'A', 3000))
-        {
-            if (sscanf(response, "%dA", &device->reverseDirection) != 1)
-            {
-                WR_DEBUG("QueryStatus: invalid message %s", response);
-                return false;
-            }
-        }
-        else
-        {
-            WR_DEBUG("QueryStatus: timeout reading reverse state from serial");
-            return false;
-        }
+        device->modelType = std::string(model);
+        device->firmwareVersion = firmware;
+        device->mechanicalAngle = angle;
+        device->backlash = backlash * 10.0f;
+        device->reverseDirection = reverse;
 
         /* Set steps per degree based on model type */
         if (device->modelType.find("Mini") != std::string::npos)
@@ -237,7 +192,8 @@ namespace WandererRotator
 
         WR_DEBUG("QueryStatus: Successfully parsed, model=%s steps=%d",
                  device->modelType.c_str(), device->stepsPerDegree);
-        return true;
+
+        return WR_SUCCESS;
     }
 
     int BacklashToCommand(float backlash)
@@ -306,7 +262,7 @@ namespace WandererRotator
                 WR_INFO("Backlash compensation: returning from overshoot by %.2f degrees", device->overshootAngle);
 
                 /* Small delay before returning */
-                usleep(100000);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
                 /* Move back by the overshoot amount to land on the actual target */
                 float returnAngle = (device->targetAngle > 0.0f) ? -device->overshootAngle : device->overshootAngle;
@@ -316,9 +272,9 @@ namespace WandererRotator
 
                 WR_DEBUG("Return move command: %s", cmd);
 
-                tcflush(device->port->GetFD(), TCIFLUSH); /* Flush input buffer */
+                device->port->Flush();
 
-                if (SendCommand(device, cmd))
+                if (SendCommand(device, cmd) == WR_SUCCESS)
                 {
                     device->status.moving = 1;
 
@@ -370,7 +326,7 @@ namespace WandererRotator
         device->listenerRunning = false;
 
         /* Small delay to let old thread exit if it's still running */
-        usleep(50000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
         /* Start new listener thread */
         device->listenerRunning = true;

@@ -39,12 +39,12 @@ extern "C" {
 #define WR_VERSION_LEN      32      /* Buffer length for version strings */
 
 typedef enum _WR_ERROR_TYPE {
-	WR_SUCCESS = 0,                     /* Success */
-	WR_ERROR_INVALID_ID,                /* Device ID is invalid */
-	WR_ERROR_INVALID_PARAMETER,         /* One or more parameters are invalid */
-	WR_ERROR_INVALID_STATE,             /* Device is not in correct state for specific API call */
-	WR_ERROR_COMMUNICATION,             /* Data communication error such as device has been removed from USB port */
-	WR_ERROR_NULL_POINTER,              /* Caller passes null-pointer parameter which is not expected */
+    WR_SUCCESS = 0,                     /* Success */
+    WR_ERROR_INVALID_ID,                /* Device ID is invalid */
+    WR_ERROR_INVALID_PARAMETER,         /* One or more parameters are invalid */
+    WR_ERROR_INVALID_STATE,             /* Device is not in correct state for specific API call */
+    WR_ERROR_COMMUNICATION,             /* Data communication error such as device has been removed from USB port */
+    WR_ERROR_NULL_POINTER,              /* Caller passes null-pointer parameter which is not expected */
 } WR_ERROR_TYPE;
 
 /*
@@ -59,25 +59,25 @@ typedef enum _WR_ERROR_TYPE {
 
 typedef struct _WR_VERSION
 {
-	unsigned int firmware;              /* Rotator firmware version */
-	char model[8];                      /* Model type (e.g., "Lite", "Mini") */
+    unsigned int firmware;              /* Rotator firmware version */
+    char model[8];                      /* Model type (e.g., "Lite", "Mini") */
 } WR_VERSION;
 
 typedef struct _WR_ROTATOR_CONFIG
 {
-	unsigned int mask;          /* Used by WRRotatorSetConfig() to indicate which field wants to be set */
-	int reverseDirection;       /* 0 - Not reverse motor moving direction, others - Reverse motor moving direction */
-	float backlash;             /* Backlash in degrees */
-	int overshoot;            	/* Backlash overshoot: 0 - disabled, others - enabled */
-	float overshootAngle;    	/* Backlash overshoot angle in degrees(move past target, then return) */
-	int overshotDirection; 		/* Backlash overshoot direction: 0 - normal, others - reverse */
+    unsigned int mask;          /* Used by WRRotatorSetConfig() to indicate which field wants to be set */
+    int reverseDirection;       /* 0 - Not reverse motor moving direction, others - Reverse motor moving direction */
+    float backlash;             /* Backlash in degrees */
+    int overshoot;              /* Backlash overshoot: 0 - disabled, others - enabled */
+    float overshootAngle;       /* Backlash overshoot angle in degrees(move past target, then return) */
+    int overshootDirection;     /* Backlash overshoot direction: 0 - normal, others - reverse */
 } WR_ROTATOR_CONFIG;
 
 typedef struct _WR_ROTATOR_STATUS {
-	float position;                     /* Current motor position in degrees */
-	int moving;                         /* 0 - motor is not moving, others - Motor is moving */
-	int stepsPerRevolution;             /* Steps per full revolution (hardware dependent) */
-	float stepSize;                     /* Step size in degrees per step */
+    float position;                     /* Current motor position in degrees */
+    int moving;                         /* 0 - motor is not moving, others - Motor is moving */
+    int stepsPerRevolution;             /* Steps per full revolution (hardware dependent) */
+    float stepSize;                     /* Step size in degrees per step */
 } WR_ROTATOR_STATUS;
 
 /* Device scanning and management */
@@ -107,4 +107,4 @@ WRAPI WR_ERROR_TYPE WRGetSDKVersion(char *version);
 }
 #endif
 
-#endif	/* WANDERER_ROTATOR_SDK_H */
+#endif    /* WANDERER_ROTATOR_SDK_H */

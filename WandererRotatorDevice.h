@@ -44,57 +44,57 @@
 
 namespace WandererRotator
 {
-	/**
-	 * Device represents a Wanderer Rotator device with its current state.
-	 */
-	struct Device
-	{
-		std::shared_ptr<SerialPort> port;
-		std::string portName;
-		std::string modelType;
-		int firmwareVersion = 0;
-		int mechanicalAngle = 0;
-		int backlash = 0;
-		int reverseDirection = 0;
-		int stepsPerDegree = 0;
-		float lastRotated = 0.0f;
-		int overshoot = 0;
-		float overshootAngle = 0.0f; /* Backlash overshoot angle in degrees */
-		int overshotDirection = 0;	 /* 0 - normal, 1 - reverse */
-		int overshooting = 0;		 /* 0 - not in overshoot, 1 - in first phase, 2 - awaiting return */
-		float targetAngle = 0.0f;	 /* Target angle for second phase of overshoot */
+    /**
+     * Device represents a Wanderer Rotator device with its current state.
+     */
+    struct Device
+    {
+        std::shared_ptr<SerialPort> port;
+        std::string portName;
+        std::string modelType;
+        int firmwareVersion = 0;
+        int mechanicalAngle = 0;
+        int backlash = 0;
+        int reverseDirection = 0;
+        int stepsPerDegree = 0;
+        float lastRotated = 0.0f;
+        int overshoot = 0;
+        float overshootAngle = 0.0f;    /* Backlash overshoot angle in degrees */
+        int overshootDirection = 0;     /* 0 - normal, 1 - reverse */
+        int overshooting = 0;           /* 0 - not in overshoot, 1 - in first phase, 2 - awaiting return */
+        float targetAngle = 0.0f;       /* Target angle for second phase of overshoot */
 
-		struct RotatorConfig
-		{
-			int reverseDirection = 0;
-			int stepRate = 50;
-		} rotator;
+        struct RotatorConfig
+        {
+            int reverseDirection = 0;
+            int stepRate = 50;
+        } rotator;
 
-		struct RotatorStatus
-		{
-			float position = 0.0f;
-			int moving = 0;
-			int stepsPerRevolution = 0;
-			float stepSize = 0.0f;
-		} status;
+        struct RotatorStatus
+        {
+            float position = 0.0f;
+            int moving = 0;
+            int stepsPerRevolution = 0;
+            float stepSize = 0.0f;
+        } status;
 
-		/* Listener thread state - don't store thread, just the flag */
-		std::atomic<bool> listenerRunning{false};
-		std::mutex listenerMutex;
+        /* Listener thread state - don't store thread, just the flag */
+        std::atomic<bool> listenerRunning{false};
+        std::mutex listenerMutex;
 
-		/* Simple destructor - nothing to clean up */
-		~Device() = default;
-	};
+        /* Simple destructor - nothing to clean up */
+        ~Device() = default;
+    };
 
-	/**
-	 * Global device registry mapping device IDs to Device objects.
-	 */
-	extern std::map<int, std::shared_ptr<Device>> g_devices;
+    /**
+     * Global device registry mapping device IDs to Device objects.
+     */
+    extern std::map<int, std::shared_ptr<Device>> g_devices;
 
-	/**
-	 * Global mutex protecting access to g_devices.
-	 */
-	extern std::mutex g_globalMutex;
+    /**
+     * Global mutex protecting access to g_devices.
+     */
+    extern std::mutex g_globalMutex;
 
 } /* namespace WandererRotator */
 

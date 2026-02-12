@@ -59,15 +59,15 @@ using namespace WandererRotator;
 static WR_ERROR_TYPE MoveInternal(std::shared_ptr<Device> device, float angle)
 {
     /* Check if overshoot applies for this movement
-     * Overshoot is only applied in one direction based on overshotDirection flag
-     * overshotDirection: 0 = apply overshoot for positive angles (CCW)
+     * Overshoot is only applied in one direction based on overshootDirection flag
+     * overshootDirection: 0 = apply overshoot for positive angles (CCW)
      *                    1 = apply overshoot for negative angles (CW)
      */
     int shouldApplyOvershoot = 0;
     if (device->overshoot && device->overshootAngle > 0.0f)
     {
-        if ((device->overshotDirection == 0 && angle > 0.0f) ||
-            (device->overshotDirection == 1 && angle < 0.0f))
+        if ((device->overshootDirection == 0 && angle > 0.0f) ||
+            (device->overshootDirection == 1 && angle < 0.0f))
         {
             shouldApplyOvershoot = 1;
         }
@@ -368,7 +368,7 @@ WRAPI WR_ERROR_TYPE WRRotatorGetConfig(int id, WR_ROTATOR_CONFIG *config)
     config->backlash = device->backlash / 10.0f; /* Convert from internal format */
     config->overshoot = device->overshoot;
     config->overshootAngle = device->overshootAngle;
-    config->overshotDirection = device->overshotDirection;
+    config->overshootDirection = device->overshootDirection;
 
     return WR_SUCCESS;
 }
@@ -442,13 +442,13 @@ WRAPI WR_ERROR_TYPE WRRotatorSetConfig(int id, WR_ROTATOR_CONFIG *config)
 
     if (config->mask & MASK_ROTATOR_OVERSHOOT_DIRECTION)
     {
-        if (config->overshotDirection < 0)
+        if (config->overshootDirection < 0)
         {
             return WR_ERROR_INVALID_PARAMETER;
         }
 
-        device->overshotDirection = config->overshotDirection != 0;
-        WR_DEBUG("Set backlash overshoot direction to %d", device->overshotDirection);
+        device->overshootDirection = config->overshootDirection != 0;
+        WR_DEBUG("Set backlash overshoot direction to %d", device->overshootDirection);
     }
 
     return WR_SUCCESS;

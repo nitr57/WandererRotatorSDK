@@ -47,7 +47,7 @@
 #include <dirent.h>
 #include <libudev.h>
 
-#define SDK_VERSION "1.2.0"
+#define SDK_VERSION "1.3.0"
 
 /* Import internal implementation for use in public C API */
 using namespace WandererRotator;
@@ -129,6 +129,53 @@ static WR_ERROR_TYPE MoveInternal(std::shared_ptr<Device> device, float angle)
     return WR_SUCCESS;
 }
 
+/* Structure for parallel device scanning */
+struct ScanWorkerTask
+{
+    std::string portName;
+    std::shared_ptr<WandererRotator::Device> device;
+    bool isValid;
+    
+    ScanWorkerTask(const char *port) : portName(port), isValid(false) {}
+};
+
+/* Worker thread function for testing a single device */
+static void ScanWorkerThread(ScanWorkerTask &task)
+{
+    auto port = std::make_shared<SerialPort>();
+    
+    /* Use minimal retry for scanning - fail fast if port is busy */
+    /* This prevents hanging when other apps are also scanning */
+    port->SetRetryParams(1, 10);  /* 1 retry, 10ms delay = ~10ms total wait */
+    
+    if (!port->Open(task.portName.c_str()))
+    {
+        WR_DEBUG("ScanWorkerThread: Failed to open port %s (skipped, may be in use by another app)", task.portName.c_str());
+        return;
+    }
+
+    auto tempDevice = std::make_shared<Device>();
+    tempDevice->port = port;
+    tempDevice->portName = task.portName;
+
+    /* Perform status handshake with retry mechanism */
+    WR_ERROR_TYPE stat = QueryStatus(tempDevice);
+
+    if(stat != WR_SUCCESS)
+    {
+        port->Close();
+        return;
+    }
+
+    WR_DEBUG("ScanWorkerThread: Valid device found on %s", task.portName.c_str());
+
+    /* Valid device found - close port */
+    port->Close();
+    
+    task.device = tempDevice;
+    task.isValid = true;
+}
+
 /* ============================================================================
  * PUBLIC SDK API IMPLEMENTATION
  * ============================================================================ */
@@ -180,14 +227,10 @@ WRAPI WR_ERROR_TYPE WRRotatorScan(int *number, int *ids)
     struct udev_list_entry *devices = udev_enumerate_get_list_entry(enumerate);
     struct udev_list_entry *entry;
 
-    char response[64];
-
-    /* Iterate through all tty devices */
+    /* Step 1: Collect all candidate CH340 devices */
+    std::vector<std::string> candidatePorts;
     udev_list_entry_foreach(entry, devices)
     {
-        if (count >= WR_MAX_NUM)
-            break;
-
         const char *path = udev_list_entry_get_name(entry);
         struct udev_device *device = udev_device_new_from_syspath(udev, path);
         if (!device)
@@ -215,8 +258,6 @@ WRAPI WR_ERROR_TYPE WRRotatorScan(int *number, int *ids)
             continue;
         }
 
-        WR_DEBUG("Found device with VID:%s PID:%s", vid, pid);
-
         if (strcmp(vid, "1a86") != 0 || strcmp(pid, "7523") != 0)
         {
             udev_device_unref(device);
@@ -225,48 +266,53 @@ WRAPI WR_ERROR_TYPE WRRotatorScan(int *number, int *ids)
 
         /* Get the device node (e.g., /dev/ttyUSB0) */
         const char *deviceNode = udev_device_get_devnode(device);
-        if (!deviceNode)
+        if (deviceNode)
         {
-            udev_device_unref(device);
-            continue;
-        }
-
-        WR_DEBUG("Trying to open device: %s", deviceNode);
-
-        /* Try to open the port */
-        auto port = std::make_shared<SerialPort>();
-        if (port->Open(deviceNode))
-        {
-            WR_DEBUG("Port opened, flushing and sending command...");
-
-            auto tempDevice = std::make_shared<Device>();
-            tempDevice->port = port;
-            tempDevice->portName = deviceNode;
-
-            /* Perform status handshake with retry mechanism */
-            WR_ERROR_TYPE stat = QueryStatus(tempDevice);
-
-            if(stat != WR_SUCCESS)
-            {
-                port->Close();
-                continue;
-            }
-
-            WR_DEBUG("Valid device found!");
-
-            /* Valid device found - close port */
-            port->Close();
-            int id = count;
-            g_devices[id] = tempDevice;
-            ids[count] = id;
-            count++;
-        }
-        else
-        {
-            WR_DEBUG("Failed to open port %s", deviceNode);
+            WR_DEBUG("Found CH340 device: %s", deviceNode);
+            candidatePorts.push_back(std::string(deviceNode));
         }
 
         udev_device_unref(device);
+    }
+
+    /* Step 2: Scan candidate devices in parallel */
+    std::vector<ScanWorkerTask> tasks;
+    std::vector<std::thread> workerThreads;
+
+    for (const auto &port : candidatePorts)
+    {
+        if (count >= WR_MAX_NUM)
+            break;
+        tasks.emplace_back(port.c_str());
+        count++;
+    }
+
+    /* Spawn worker threads for each candidate port */
+    for (auto &task : tasks)
+    {
+        workerThreads.emplace_back(ScanWorkerThread, std::ref(task));
+    }
+
+    /* Wait for all threads to complete */
+    for (auto &thread : workerThreads)
+    {
+        if (thread.joinable())
+        {
+            thread.join();
+        }
+    }
+
+    /* Step 3: Collect valid devices */
+    count = 0;
+    for (auto &task : tasks)
+    {
+        if (task.isValid && count < WR_MAX_NUM)
+        {
+            int id = count;
+            g_devices[id] = task.device;
+            ids[count] = id;
+            count++;
+        }
     }
 
     /* Clean up udev resources */
@@ -299,6 +345,9 @@ WRAPI WR_ERROR_TYPE WRRotatorOpen(int id)
     {
         WR_DEBUG("WRRotatorOpen: Creating new SerialPort instance");
         device->port = std::make_shared<SerialPort>();
+        /* Use standard retry parameters for normal device open (more tolerant than scan) */
+        /* Default: 3 retries with 200ms delay = ~600ms max wait time */
+        device->port->SetRetryParams(3, 200);
     }
 
     WR_DEBUG("WRRotatorOpen: Attempting to open port %s", device->portName.c_str());

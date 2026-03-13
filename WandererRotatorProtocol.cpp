@@ -207,7 +207,7 @@ namespace WandererRotator
     }
 
     /* Background listener thread function for movement completion */
-    static void MoveListenerThreadFunc(std::shared_ptr<Device> device)
+    static void MoveListenerThreadFunc(Device* device)
     {
         if (!device || !device->port)
         {
@@ -224,90 +224,94 @@ namespace WandererRotator
         }
 
         char buffer[32];
+        bool continueLoop = true;
 
-        // Read the actual angle moved
-        if (device->port->Read((unsigned char *)buffer, 32, 'A', 90000))
+        while (continueLoop && device->listenerRunning)
         {
-            if (sscanf(buffer, "%fA", &device->lastRotated) != 1)
+            continueLoop = false;
+
+            // Read the actual angle moved
+            if (device->port->Read((unsigned char *)buffer, 32, 'A', 90000))
             {
-                WR_DEBUG("MoveListener: Invalid message");
-                device->listenerRunning = false;
-                return;
-            }
-        }
-        else
-        {
-            WR_DEBUG("MoveListener: Timeout reading from port");
-            device->listenerRunning = false;
-            return;
-        }
-
-        // Read the new position
-        if (device->port->Read((unsigned char *)buffer, 32, 'A', 3000))
-        {
-            if (sscanf(buffer, "%dA", &device->mechanicalAngle) != 1)
-            {
-                WR_DEBUG("MoveListener: Invalid message");
-                device->listenerRunning = false;
-                return;
-            }
-            device->status.position = device->mechanicalAngle / 1000.0f; /* Convert from *1000 format to degrees */
-
-            /* Check if we need to perform second phase of overshoot compensation */
-            if (device->overshooting == 1)
-            {
-                device->overshooting = 2; /* Mark that first phase is done, ready for return */
-                /* Keep moving = 1 since we have a second phase to do */
-
-                WR_INFO("Backlash compensation: returning from overshoot by %.2f degrees", device->overshootAngle);
-
-                /* Small delay before returning */
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-                /* Move back by the overshoot amount to land on the actual target */
-                float returnAngle = (device->targetAngle > 0.0f) ? -device->overshootAngle : device->overshootAngle;
-                int command_value = 1000000 + (int)(returnAngle * device->stepsPerDegree);
-                char cmd[16];
-                snprintf(cmd, sizeof(cmd), "%d", command_value);
-
-                WR_DEBUG("Return move command: %s", cmd);
-
-                device->port->Flush();
-
-                if (SendCommand(device, cmd) == WR_SUCCESS)
+                if (sscanf(buffer, "%fA", &device->lastRotated) != 1)
                 {
-                    device->status.moving = 1;
-
-                    /* Recursively call this function to handle the return movement */
-                    device->listenerRunning = false; /* Will be reset by StartMoveListener */
-                    StartMoveListener(device);
+                    WR_DEBUG("MoveListener: Invalid message");
+                    device->listenerRunning = false;
                     return;
                 }
-                else
-                {
-                    WR_ERROR("Failed to send return movement command");
-                    device->overshooting = 0;
-                    device->status.moving = 0;
-                }
-            }
-            else if (device->overshooting == 2)
-            {
-                /* Second phase complete */
-                device->overshooting = 0;
-                device->status.moving = 0;
-                WR_INFO("Backlash compensation complete, at target %.2f degrees", device->targetAngle);
             }
             else
             {
-                /* No overshoot, just regular movement complete */
-                device->status.moving = 0;
+                WR_DEBUG("MoveListener: Timeout reading from port");
+                device->listenerRunning = false;
+                return;
             }
-        }
-        else
-        {
-            WR_DEBUG("MoveListener: Timeout reading from port");
-            device->listenerRunning = false;
-            return;
+
+            // Read the new position
+            if (device->port->Read((unsigned char *)buffer, 32, 'A', 3000))
+            {
+                if (sscanf(buffer, "%dA", &device->mechanicalAngle) != 1)
+                {
+                    WR_DEBUG("MoveListener: Invalid message");
+                    device->listenerRunning = false;
+                    return;
+                }
+                device->status.position = device->mechanicalAngle / 1000.0f; /* Convert from *1000 format to degrees */
+
+                /* Check if we need to perform second phase of overshoot compensation */
+                if (device->overshooting == 1)
+                {
+                    device->overshooting = 2; /* Mark that first phase is done, ready for return */
+                    /* Keep moving = 1 since we have a second phase to do */
+
+                    WR_INFO("Backlash compensation: returning from overshoot by %.2f degrees", device->overshootAngle);
+
+                    /* Small delay before returning */
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+                    /* Move back by the overshoot amount to land on the actual target */
+                    float returnAngle = (device->targetAngle > 0.0f) ? -device->overshootAngle : device->overshootAngle;
+                    int command_value = 1000000 + (int)(returnAngle * device->stepsPerDegree);
+                    char cmd[16];
+                    snprintf(cmd, sizeof(cmd), "%d", command_value);
+
+                    WR_DEBUG("Return move command: %s", cmd);
+
+                    device->port->Flush();
+                    device->port->Drain();
+                    device->port->ClearRxBuffer();
+
+                    if (device->port->Write((const unsigned char *)cmd, strlen(cmd)))
+                    {
+                        device->status.moving = 1;
+                        continueLoop = true; /* Loop for second phase */
+                    }
+                    else
+                    {
+                        WR_ERROR("Failed to send return movement command");
+                        device->overshooting = 0;
+                        device->status.moving = 0;
+                    }
+                }
+                else if (device->overshooting == 2)
+                {
+                    /* Second phase complete */
+                    device->overshooting = 0;
+                    device->status.moving = 0;
+                    WR_INFO("Backlash compensation complete, at target %.2f degrees", device->targetAngle);
+                }
+                else
+                {
+                    /* No overshoot, just regular movement complete */
+                    device->status.moving = 0;
+                }
+            }
+            else
+            {
+                WR_DEBUG("MoveListener: Timeout reading from port");
+                device->listenerRunning = false;
+                return;
+            }
         }
 
         /* Mark listener as stopped before exiting */
@@ -322,16 +326,14 @@ namespace WandererRotator
             return;
         }
 
-        /* Stop any existing listener by setting the flag */
+        /* Stop any existing listener and join it before starting a new one */
         device->listenerRunning = false;
-
-        /* Small delay to let old thread exit if it's still running */
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (device->moveListenerThread.joinable())
+            device->moveListenerThread.join();
 
         /* Start new listener thread */
         device->listenerRunning = true;
-        std::thread listenerThread(MoveListenerThreadFunc, device);
-        listenerThread.detach(); /* Detach immediately - let it run independently */
+        device->moveListenerThread = std::thread(MoveListenerThreadFunc, device.get());
         WR_DEBUG("StartMoveListener: Listener thread started");
     }
 
@@ -342,8 +344,10 @@ namespace WandererRotator
             return;
         }
 
-        /* Signal listener thread to stop */
+        /* Signal listener thread to stop and join it */
         device->listenerRunning = false;
-        WR_DEBUG("StopMoveListener: Listener stop requested");
+        if (device->moveListenerThread.joinable())
+            device->moveListenerThread.join();
+        WR_DEBUG("StopMoveListener: Listener stopped");
     }
 } /* namespace WandererRotator */

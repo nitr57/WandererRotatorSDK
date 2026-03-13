@@ -78,12 +78,17 @@ namespace WandererRotator
             float stepSize = 0.0f;
         } status;
 
-        /* Listener thread state - don't store thread, just the flag */
+        /* Listener thread state */
         std::atomic<bool> listenerRunning{false};
         std::mutex listenerMutex;
+        std::thread moveListenerThread;
 
-        /* Simple destructor - nothing to clean up */
-        ~Device() = default;
+        ~Device()
+        {
+            listenerRunning = false;
+            if (moveListenerThread.joinable())
+                moveListenerThread.join();
+        }
     };
 
     /**

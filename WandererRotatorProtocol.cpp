@@ -141,7 +141,9 @@ namespace WandererRotator
         }
 
         char response[64];
-        RETURN_IF_ERROR(SendAndWaitForReply(device, "1500001\n", response, 64));
+        RETURN_IF_ERROR(SendAndWaitForReplyWithRetry(device, "1500001\n", response, 64,
+                                                     200, 500, 3, 300,
+                                                     "QueryStatus handshake"));
 
         WR_INFO("Response: '%s'", response);
 

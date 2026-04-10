@@ -258,6 +258,14 @@ namespace WandererRotator
         WR_DEBUG("SerialPort::Open: tcsetattr succeeded");
 
         tcflush(fd, TCIOFLUSH);
+
+        /* Allow the USB-serial adapter and MCU to settle after port open.
+         * CH340-based devices may trigger a microcontroller reset on the first
+         * open after a fresh USB plug-in. The bootloader typically needs
+         * ~200-500ms before the application firmware starts responding. */
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        tcflush(fd, TCIOFLUSH);
+
         WR_DEBUG("SerialPort::Open: Successfully opened %s (fd=%d)", portName, (int)fd);
 #endif
         return true;

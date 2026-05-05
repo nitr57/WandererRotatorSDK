@@ -168,6 +168,15 @@ namespace WandererRotator
 
         fd = (intptr_t)open_fd;
 
+        /* Mark port exclusive: prevents any further open() on this device node
+         * (even from the same process) until the fd is closed. This stops
+         * sibling SDK scan threads from racing and consuming serial data that
+         * belongs to this device's listener thread. */
+        if (ioctl(open_fd, TIOCEXCL) < 0)
+        {
+            WR_DEBUG("SerialPort::Open: TIOCEXCL failed (errno=%d), continuing anyway", errno);
+        }
+
         struct termios tty;
         if (tcgetattr(open_fd, &tty) != 0)
         {

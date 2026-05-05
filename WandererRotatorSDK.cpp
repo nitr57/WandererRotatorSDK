@@ -47,7 +47,7 @@
 #include <dirent.h>
 #include <libudev.h>
 
-#define SDK_VERSION "1.3.2"
+#define SDK_VERSION "1.3.3"
 
 /* Import internal implementation for use in public C API */
 using namespace WandererRotator;

@@ -144,12 +144,12 @@ static void ScanWorkerThread(ScanWorkerTask &task)
 {
     auto port = std::make_shared<SerialPort>();
     
-    /* Allow up to ~3 seconds for a competing SDK scan to release the port.
-     * Workers run in parallel so this does not multiply scan duration —
-     * total scan time = max(all worker times), not sum. A permanently
-     * connected device (TIOCEXCL held indefinitely) will still be skipped
-     * after timeout, which is correct. */
-    port->SetRetryParams(60, 50);  /* 60 * 50ms = 3000ms total timeout, 50ms poll interval */
+    /* Allow up to ~6 seconds for competing SDK scans to release the port.
+     * Each competing scan holds a port for up to ~1s (handshake timeout).
+     * With multiple SDKs scanning simultaneously, worst case is several
+     * sequential 1s holds before we get a window. Workers run in parallel
+     * so this does not multiply scan duration across ports. */
+    port->SetRetryParams(120, 50);  /* 120 * 50ms = 6000ms total timeout, 50ms poll interval */
     
     if (!port->Open(task.portName.c_str()))
     {

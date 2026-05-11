@@ -349,10 +349,9 @@ WRAPI WR_ERROR_TYPE WRRotatorOpen(int id)
         WR_DEBUG("WRRotatorOpen: Creating new SerialPort instance");
         device->port = std::make_shared<SerialPort>();
         /* Use aggressive retry parameters for normal device open.
-         * More tolerant than scan to handle other SDKs scanning concurrently.
-         * 10 retries with 300ms delay + 1.5x exponential backoff = ~5+ seconds wait
-         * This ensures we don't fail if another scanner briefly holds the port. */
-        device->port->SetRetryParams(10, 300);
+         * Must outlast the full scan+open overlap window across all SDKs.
+         * 20 * 500ms = 10 seconds total wait, polling every 50ms. */
+        device->port->SetRetryParams(20, 500);
     }
 
     WR_DEBUG("WRRotatorOpen: Attempting to open port %s", device->portName.c_str());

@@ -144,13 +144,16 @@ static void ScanWorkerThread(ScanWorkerTask &task)
 {
     auto port = std::make_shared<SerialPort>();
     
-    /* Use minimal retry for scanning - fail fast if port is busy */
-    /* This prevents hanging when other apps are also scanning */
-    port->SetRetryParams(1, 10);  /* 1 retry, 10ms delay = ~10ms total wait */
+    /* Allow up to ~3 seconds for a competing SDK scan to release the port.
+     * Workers run in parallel so this does not multiply scan duration —
+     * total scan time = max(all worker times), not sum. A permanently
+     * connected device (TIOCEXCL held indefinitely) will still be skipped
+     * after timeout, which is correct. */
+    port->SetRetryParams(60, 50);  /* 60 * 50ms = 3000ms total timeout, 50ms poll interval */
     
     if (!port->Open(task.portName.c_str()))
     {
-        WR_DEBUG("ScanWorkerThread: Failed to open port %s (skipped, may be in use by another app)", task.portName.c_str());
+        WR_DEBUG("ScanWorkerThread: Failed to open port %s (skipped, in use by another app)", task.portName.c_str());
         return;
     }
 
@@ -345,9 +348,11 @@ WRAPI WR_ERROR_TYPE WRRotatorOpen(int id)
     {
         WR_DEBUG("WRRotatorOpen: Creating new SerialPort instance");
         device->port = std::make_shared<SerialPort>();
-        /* Use standard retry parameters for normal device open (more tolerant than scan) */
-        /* Default: 3 retries with 200ms delay = ~600ms max wait time */
-        device->port->SetRetryParams(3, 200);
+        /* Use aggressive retry parameters for normal device open.
+         * More tolerant than scan to handle other SDKs scanning concurrently.
+         * 10 retries with 300ms delay + 1.5x exponential backoff = ~5+ seconds wait
+         * This ensures we don't fail if another scanner briefly holds the port. */
+        device->port->SetRetryParams(10, 300);
     }
 
     WR_DEBUG("WRRotatorOpen: Attempting to open port %s", device->portName.c_str());

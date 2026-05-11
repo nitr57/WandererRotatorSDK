@@ -124,37 +124,39 @@ namespace WandererRotator
 
         WR_DEBUG("SerialPort::Open: Opened %s (handle=%p)", device.c_str(), h);
 #else
-        /* Try to open with retry logic for busy ports */
+        /* Try to open with polling retry logic for busy ports.
+         * There is no kernel mechanism to wait for TIOCEXCL release, so we
+         * poll at a short fixed interval until the port becomes available or
+         * we exceed the total timeout budget. */
         int open_fd = -1;
         int attempt = 0;
-        int delayMs = retryDelayMs;
+        int totalWaitMs = 0;
+        int totalTimeoutMs = retryDelayMs * maxRetries; /* Total timeout budget in ms */
+        const int pollIntervalMs = 50; /* Poll every 50ms */
 
-        while (attempt < maxRetries && open_fd < 0)
+        while (open_fd < 0 && totalWaitMs < totalTimeoutMs)
         {
-            /* Open without O_NONBLOCK to allow blocking I/O */
             open_fd = open(portName, O_RDWR | O_NOCTTY);
-            WR_DEBUG("SerialPort::Open: Attempt %d/%d, open() returned fd=%d", 
-                     attempt + 1, maxRetries, open_fd);
+            WR_DEBUG("SerialPort::Open: Attempt %d, open() returned fd=%d, elapsed=%dms",
+                     attempt + 1, open_fd, totalWaitMs);
 
             if (open_fd < 0)
             {
                 int last_errno = errno;
-                /* EBUSY means resource is busy, worth retrying */
-                /* EAGAIN means resource temporarily unavailable, worth retrying */
-                if ((last_errno == EBUSY || last_errno == EAGAIN || last_errno == EACCES) 
-                    && attempt < maxRetries - 1)
+                /* EBUSY: port held exclusively by another process (TIOCEXCL)
+                 * EAGAIN/EACCES: temporarily unavailable - all worth waiting for */
+                if (last_errno == EBUSY || last_errno == EAGAIN || last_errno == EACCES)
                 {
-                    WR_DEBUG("SerialPort::Open: Port busy/unavailable (errno=%d), retrying in %dms...",
-                            last_errno, delayMs);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
-                    delayMs = (delayMs * 3) / 2; /* 1.5x exponential backoff */
+                    WR_DEBUG("SerialPort::Open: Port busy (errno=%d), polling in %dms (elapsed=%dms, timeout=%dms)...",
+                            last_errno, pollIntervalMs, totalWaitMs, totalTimeoutMs);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(pollIntervalMs));
+                    totalWaitMs += pollIntervalMs;
                     attempt++;
-                    continue;
                 }
                 else
                 {
-                    WR_ERROR("SerialPort::Open: Failed to open port %s (errno=%d, attempt %d/%d)", 
-                             portName, last_errno, attempt + 1, maxRetries);
+                    WR_ERROR("SerialPort::Open: Failed to open port %s (errno=%d, unrecoverable)",
+                             portName, last_errno);
                     return false;
                 }
             }
@@ -162,7 +164,8 @@ namespace WandererRotator
 
         if (open_fd < 0)
         {
-            WR_ERROR("SerialPort::Open: Failed to open port %s after %d retries", portName, maxRetries);
+            WR_ERROR("SerialPort::Open: Failed to open port %s after waiting %dms (timeout=%dms)",
+                     portName, totalWaitMs, totalTimeoutMs);
             return false;
         }
 

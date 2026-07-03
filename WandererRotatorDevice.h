@@ -52,6 +52,7 @@ namespace WandererRotator
         std::shared_ptr<SerialPort> port;
         std::string portName;
         std::string modelType;
+        bool isOpen = false;
         int firmwareVersion = 0;
         int mechanicalAngle = 0;
         int backlash = 0;
@@ -82,6 +83,16 @@ namespace WandererRotator
         std::atomic<bool> listenerRunning{false};
         std::mutex listenerMutex;
         std::thread moveListenerThread;
+
+        /* Serializes Move/MoveTo/Close's handling of moveListenerThread (i.e. the
+         * SendCommand + StartMoveListener/StopMoveListener sequence) on this device.
+         * The rotator can take up to ~90s to complete a move and stays silent on
+         * the wire the whole time, so StartMoveListener's join on the previous
+         * listener can legitimately take that long - callers must hold this
+         * per-device lock (never g_globalMutex) while it does, so other devices
+         * and quick per-device calls (StopMove, GetStatus, ...) are never blocked
+         * by it. */
+        std::mutex moveMutex;
 
         ~Device()
         {

@@ -185,6 +185,15 @@ namespace WandererRotator
                 device->stepsPerDegree = 1155;
             }
         }
+        else
+        {
+            /* Unknown model - fall back to the most common value rather than
+             * leaving stepsPerDegree at 0, which would make stepSize = 1/0 (inf)
+             * and every move command compute to exactly zero steps. */
+            WR_ERROR("QueryStatus: Unknown model '%s', defaulting stepsPerDegree to 1155",
+                     device->modelType.c_str());
+            device->stepsPerDegree = 1155;
+        }
 
         device->status.stepsPerRevolution = device->stepsPerDegree * 360;
         device->status.stepSize = 1.0f / device->stepsPerDegree;
@@ -328,6 +337,9 @@ namespace WandererRotator
             return;
         }
 
+        /* Caller must hold device->moveMutex (never g_globalMutex) - the join below
+         * can legitimately block for up to ~90s while a prior move completes. */
+
         /* Stop any existing listener and join it before starting a new one */
         device->listenerRunning = false;
         if (device->moveListenerThread.joinable())
@@ -345,6 +357,9 @@ namespace WandererRotator
         {
             return;
         }
+
+        /* Caller must hold device->moveMutex (never g_globalMutex) - the join below
+         * can legitimately block for up to ~90s while a prior move completes. */
 
         /* Signal listener thread to stop and join it */
         device->listenerRunning = false;

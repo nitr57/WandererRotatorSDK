@@ -52,7 +52,7 @@ namespace WandererRotator
         std::shared_ptr<SerialPort> port;
         std::string portName;
         std::string modelType;
-        bool isOpen = false;
+        std::atomic<bool> isOpen{false}; /* Written outside g_globalMutex by Close, so must be atomic */
         int firmwareVersion = 0;
         int mechanicalAngle = 0;
         int backlash = 0;

@@ -31,25 +31,20 @@
 namespace WandererRotator
 {
     /**
-     * Send a command to the device and ignore the response.
+     * Send a command to the device, discarding any unread input first.
+     * Caller must hold device->ioMutex (or own the port as the listener).
      *
      * @param device Device to send command to
-     * @param command Command string (no newline)
-     * @param timeoutMs Timeout in milliseconds (default 3000ms)
-     * @return true if command succeeded
+     * @param command Command string
+     * @return WR_SUCCESS if the command was written
      */
-    WR_ERROR_TYPE SendCommand(std::shared_ptr<Device> device, const char *command, int timeoutMs = 300);
-    WR_ERROR_TYPE SendAndWaitForReply(std::shared_ptr<Device> device, const char* cmd, char* buffer, int maxLen, int sendTimeoutMs = 200, int recvTimeoutMs = 500);
-    WR_ERROR_TYPE SendAndWaitForReplyWithRetry(std::shared_ptr<Device> device,
-                                               const char *cmd,
-                                               char *buffer,
-                                               int maxLen,
-                                               int sendTimeoutMs = 200,
-                                               int recvTimeoutMs = 200,
-                                               int maxRetries = 3,
-                                               int retryDelayMs = 200,
-                                               const char *timeoutMsg = "timeout");
+    WR_ERROR_TYPE SendCommand(std::shared_ptr<Device> device, const char *command);
+    WR_ERROR_TYPE SendAndWaitForReply(std::shared_ptr<Device> device, const char* cmd, char* buffer, int maxLen, int recvTimeoutMs = 500);
 
+    /**
+     * Query model, firmware, position, backlash and reverse direction from the
+     * device and store them in the Device. Retries missing or unparseable replies.
+     */
     WR_ERROR_TYPE QueryStatus(std::shared_ptr<Device> device);
 
     /**
@@ -70,13 +65,33 @@ namespace WandererRotator
     const char *ReverseDirectionToCommand(int reverse);
 
     /**
+     * Send "stop" and wait briefly for the reply it produces if a move was in
+     * progress (an idle device does not answer). Safe in any state: unlike
+     * numeric commands, "stop" never starts a move. Caller must own the port.
+     */
+    void StopAndDrain(Device *device);
+
+    /**
+     * Convert a mechanical angle in thousandths of a degree (which the device
+     * does not wrap) to a position in [0, 360) degrees.
+     */
+    float MechanicalAngleToPosition(int mechanicalAngle);
+
+    /**
+     * Set or clear device->status.moving and wake callers waiting for the
+     * device to become idle. Must not be called with stateMutex held.
+     */
+    void SetMoving(Device *device, bool moving);
+
+    /**
      * Start listening for movement completion messages.
      * Spawns a background thread that reads serial data until movement finishes.
      * Should be called before triggering a move command.
      *
      * @param device Device to listen on
+     * @return false if the listener thread could not be started
      */
-    void StartMoveListener(std::shared_ptr<Device> device);
+    bool StartMoveListener(std::shared_ptr<Device> device);
 
     /**
      * Stop listening for movement completion messages.

@@ -36,9 +36,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <deque>
+#include <algorithm>
+#include <exception>
 #include <cmath>
 #include <cctype>
-#include <mutex>
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
@@ -47,7 +49,7 @@
 #include <dirent.h>
 #include <libudev.h>
 
-#define SDK_VERSION "1.4.0"
+#define SDK_VERSION "1.5.0"
 
 /* Import internal implementation for use in public C API */
 using namespace WandererRotator;
@@ -56,13 +58,85 @@ using namespace WandererRotator;
  * HELPER FUNCTIONS
  * ============================================================================ */
 
-static WR_ERROR_TYPE MoveInternal(std::shared_ptr<Device> device, float angle)
+/* No C++ exception may cross the extern "C" API boundary. */
+#define WR_API_CATCH                                                  \
+    catch (const std::exception &e)                                   \
+    {                                                                 \
+        WR_ERROR("%s: unexpected exception: %s", __func__, e.what()); \
+        return WR_ERROR_COMMUNICATION;                                \
+    }                                                                 \
+    catch (...)                                                       \
+    {                                                                 \
+        WR_ERROR("%s: unexpected exception", __func__);               \
+        return WR_ERROR_COMMUNICATION;                                \
+    }
+
+/* Largest step count sent in a single move command. Moves are encoded as
+ * 1000000 + steps, so anything at or beyond +/-500000 steps would land in the
+ * 15xxxxx/16xxxxx/17xxxxx ranges used for status, backlash and reverse
+ * direction. Larger moves are split into consecutive segments instead. */
+static const int kMaxStepsPerCommand = 499999;
+
+/* Upper bound on the steps of one move phase. Far above the 3600 degree API
+ * limit; it only keeps the float -> integer conversion well defined. */
+static const float kMaxMoveSteps = 1.0e8f;
+
+/* Serializes WRRotatorScan calls without blocking any other API call */
+static std::mutex g_scanMutex;
+
+static std::shared_ptr<Device> FindDevice(int id)
 {
-    /* Serializes this device's command-send + listener-restart sequence against
-     * any other Move/MoveTo/Close call for the same device. Held for the whole
-     * function - including StartMoveListener's join, which can legitimately take
-     * up to ~90s - but callers must never hold g_globalMutex while this runs. */
-    std::lock_guard<std::mutex> moveLock(device->moveMutex);
+    std::lock_guard<std::mutex> lock(g_globalMutex);
+    auto it = g_devices.find(id);
+    return it == g_devices.end() ? nullptr : it->second;
+}
+
+/* Waits until no move is in progress on this device, then returns holding its
+ * ioMutex. Calls that need the serial port while a move is running (Move,
+ * MoveTo, SetConfig, SyncPosition) therefore run once that move completes -
+ * which can take minutes for a very large move (~3.7 degrees/s). */
+static std::unique_lock<std::mutex> LockIdle(const std::shared_ptr<Device> &device)
+{
+    while (true)
+    {
+        {
+            std::unique_lock<std::mutex> state(device->stateMutex);
+            device->moveDoneCv.wait(state, [&] { return !device->status.moving && !device->listenerRunning; });
+        }
+
+        std::unique_lock<std::mutex> io(device->ioMutex);
+        if (!device->status.moving)
+        {
+            /* Reap the finished listener thread */
+            StopMoveListener(device);
+            return io;
+        }
+        /* Another call started a move in between - wait for that one too */
+    }
+}
+
+static void AppendMoveSegments(std::deque<int> &segments, long long steps)
+{
+    while (steps != 0)
+    {
+        long long chunk = std::max<long long>(-kMaxStepsPerCommand, std::min<long long>(kMaxStepsPerCommand, steps));
+        segments.push_back((int)chunk);
+        steps -= chunk;
+    }
+}
+
+/* Caller must hold device->ioMutex (see LockIdle) and have checked the device is open. */
+static WR_ERROR_TYPE MoveInternalLocked(std::shared_ptr<Device> device, float angle)
+{
+    int overshoot, overshootDirection, stepsPerDegree;
+    float overshootAngle;
+    {
+        std::lock_guard<std::mutex> lock(device->stateMutex);
+        overshoot = device->overshoot;
+        overshootAngle = device->overshootAngle;
+        overshootDirection = device->overshootDirection;
+        stepsPerDegree = device->stepsPerDegree;
+    }
 
     /* Check if overshoot applies for this movement
      * Overshoot is only applied in one direction based on overshootDirection flag
@@ -70,39 +144,34 @@ static WR_ERROR_TYPE MoveInternal(std::shared_ptr<Device> device, float angle)
      *                    1 = apply overshoot for negative angles (CW)
      */
     int shouldApplyOvershoot = 0;
-    if (device->overshoot && device->overshootAngle > 0.0f)
+    if (overshoot && overshootAngle > 0.0f)
     {
-        if ((device->overshootDirection == 0 && angle > 0.0f) ||
-            (device->overshootDirection == 1 && angle < 0.0f))
+        if ((overshootDirection == 0 && angle > 0.0f) ||
+            (overshootDirection == 1 && angle < 0.0f))
         {
             shouldApplyOvershoot = 1;
         }
     }
 
-    /* Phase 1: Move to the desired angle (+ overshoot if applicable) */
+    /* Phase 1: Move to the desired angle (+ overshoot if applicable)
+     * Phase 2: Move back by the overshoot amount to land on the actual target */
     float moveAngle = angle;
+    float returnAngle = 0.0f;
     if (shouldApplyOvershoot)
     {
         /* Add overshoot in the direction of movement */
         if (angle > 0.0f)
         {
-            moveAngle = angle + device->overshootAngle;
+            moveAngle = angle + overshootAngle;
+            returnAngle = -overshootAngle;
         }
         else
         {
-            moveAngle = angle - device->overshootAngle;
+            moveAngle = angle - overshootAngle;
+            returnAngle = overshootAngle;
         }
         WR_INFO("Applying overshoot: moving to %.2f (target: %.2f, overshoot: %.2f)", 
-                moveAngle, angle, device->overshootAngle);
-
-        /* Mark that we're in overshoot mode - waiting for first phase to complete */
-        device->overshooting = 1;
-        device->targetAngle = angle;
-    }
-    else
-    {
-        /* Ensure overshoot flag is cleared if not applying */
-        device->overshooting = 0;
+                moveAngle, angle, overshootAngle);
     }
 
     /* Relative movement by angle in degrees
@@ -110,19 +179,50 @@ static WR_ERROR_TYPE MoveInternal(std::shared_ptr<Device> device, float angle)
      * Negative angle = clockwise
      * Command: 1000000 + (angle * stepsPerDegree)
      */
-    int command_value = 1000000 + (int)(moveAngle * device->stepsPerDegree);
-    char cmd[16];
-    snprintf(cmd, sizeof(cmd), "%d", command_value);
+    float moveSteps = moveAngle * stepsPerDegree;
+    float returnSteps = returnAngle * stepsPerDegree;
+    if (!std::isfinite(moveSteps) || fabsf(moveSteps) > kMaxMoveSteps ||
+        !std::isfinite(returnSteps) || fabsf(returnSteps) > kMaxMoveSteps)
+    {
+        return WR_ERROR_INVALID_PARAMETER;
+    }
 
-    WR_DEBUG("MoveInternal: angle=%.2f, command=%s", moveAngle, cmd);
+    std::deque<int> segments;
+    AppendMoveSegments(segments, llroundf(moveSteps));
+    AppendMoveSegments(segments, llroundf(returnSteps));
+
+    if (segments.empty())
+    {
+        /* Less than one step - the rotator would not move and never reply */
+        WR_DEBUG("MoveInternal: angle=%.4f is below one step, nothing to do", angle);
+        return WR_SUCCESS;
+    }
+
+    /* Newline-terminated: without it the device waits ~1s for more input
+     * before starting, and a command sent within that second (e.g. "stop")
+     * would be merged into this one. */
+    int command_value = 1000000 + segments.front();
+    segments.pop_front();
+    char cmd[16];
+    snprintf(cmd, sizeof(cmd), "%d\n", command_value);
+
+    WR_DEBUG("MoveInternal: angle=%.2f, command=%s, %zu more segment(s)", moveAngle, cmd, segments.size());
 
     /* Drain any leftover data in the buffer before sending move command */
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     device->port->Flush();
 
+    /* The listener sends the remaining segments as each one completes */
+    {
+        std::lock_guard<std::mutex> lock(device->pendingMovesMutex);
+        device->pendingMoves = std::move(segments);
+    }
+    device->currentSegmentSteps = command_value - 1000000;
+
     if (SendCommand(device, cmd) != WR_SUCCESS)
     {
-        device->overshooting = 0;
+        std::lock_guard<std::mutex> lock(device->pendingMovesMutex);
+        device->pendingMoves.clear();
         return WR_ERROR_COMMUNICATION;
     }
 
@@ -130,7 +230,15 @@ static WR_ERROR_TYPE MoveInternal(std::shared_ptr<Device> device, float angle)
     device->status.moving = 1;
 
     /* Listener will get the rotation feedback */
-    StartMoveListener(device);
+    if (!StartMoveListener(device))
+    {
+        {
+            std::lock_guard<std::mutex> lock(device->pendingMovesMutex);
+            device->pendingMoves.clear();
+        }
+        SetMoving(device.get(), false);
+        return WR_ERROR_COMMUNICATION;
+    }
 
     return WR_SUCCESS;
 }
@@ -147,6 +255,7 @@ struct ScanWorkerTask
 
 /* Worker thread function for testing a single device */
 static void ScanWorkerThread(ScanWorkerTask &task)
+try
 {
     auto port = std::make_shared<SerialPort>();
     
@@ -184,24 +293,32 @@ static void ScanWorkerThread(ScanWorkerTask &task)
     task.device = tempDevice;
     task.isValid = true;
 }
+catch (const std::exception &e)
+{
+    /* An exception escaping a std::thread would call std::terminate */
+    WR_ERROR("ScanWorkerThread: unexpected exception on %s: %s", task.portName.c_str(), e.what());
+}
 
 /* ============================================================================
  * PUBLIC SDK API IMPLEMENTATION
  * ============================================================================ */
 
 WRAPI WR_ERROR_TYPE WRGetSDKVersion(char *version)
+try
 {
     if (!version)
     {
         return WR_ERROR_NULL_POINTER;
     }
 
-    strncpy(version, SDK_VERSION, WR_VERSION_LEN - 1);
-    version[WR_VERSION_LEN - 1] = '\0';
+    static_assert(sizeof(SDK_VERSION) <= WR_VERSION_LEN, "SDK_VERSION too long");
+    memcpy(version, SDK_VERSION, sizeof(SDK_VERSION));
     return WR_SUCCESS;
 }
+WR_API_CATCH
 
 WRAPI WR_ERROR_TYPE WRRotatorScan(int *number, int *ids)
+try
 {
     WR_INFO("Scanning for devices");
     if (!number || !ids)
@@ -210,42 +327,45 @@ WRAPI WR_ERROR_TYPE WRRotatorScan(int *number, int *ids)
         return WR_ERROR_NULL_POINTER;
     }
 
-    std::lock_guard<std::mutex> lock(g_globalMutex);
+    /* Only one scan at a time. g_globalMutex is not held while probing, so
+     * calls on already-registered devices are never blocked by a scan. */
+    std::lock_guard<std::mutex> scanLock(g_scanMutex);
 
-    int count = 0;
-
-    /* Build a set of already-registered port names so a rescan neither re-probes
-     * a port that is already open (which would just fail/hang) nor assigns it a
-     * new id that could collide with and silently replace the live device. */
+    /* Ports that already belong to a registered device are not probed again:
+     * an open one would just fail/hang, and re-registering it would give the
+     * same device a second id. */
     std::map<std::string, int> connectedPorts;
-    for (const auto &pair : g_devices)
     {
-        if (!pair.second->portName.empty())
+        std::lock_guard<std::mutex> lock(g_globalMutex);
+        for (const auto &pair : g_devices)
         {
-            connectedPorts[pair.second->portName] = pair.first;
+            if (!pair.second->portName.empty())
+            {
+                connectedPorts[pair.second->portName] = pair.first;
+            }
         }
     }
 
     /* Create udev context */
-    struct udev *udev = udev_new();
+    std::unique_ptr<struct udev, decltype(&udev_unref)> udev(udev_new(), &udev_unref);
     if (!udev)
     {
         return WR_ERROR_COMMUNICATION;
     }
 
     /* Create enumeration for tty devices */
-    struct udev_enumerate *enumerate = udev_enumerate_new(udev);
+    std::unique_ptr<struct udev_enumerate, decltype(&udev_enumerate_unref)> enumerate(
+        udev_enumerate_new(udev.get()), &udev_enumerate_unref);
     if (!enumerate)
     {
-        udev_unref(udev);
         return WR_ERROR_COMMUNICATION;
     }
 
     /* Filter for tty subsystem */
-    udev_enumerate_add_match_subsystem(enumerate, "tty");
-    udev_enumerate_scan_devices(enumerate);
+    udev_enumerate_add_match_subsystem(enumerate.get(), "tty");
+    udev_enumerate_scan_devices(enumerate.get());
 
-    struct udev_list_entry *devices = udev_enumerate_get_list_entry(enumerate);
+    struct udev_list_entry *devices = udev_enumerate_get_list_entry(enumerate.get());
     struct udev_list_entry *entry;
 
     /* Step 1: Collect all candidate CH340 devices */
@@ -253,7 +373,8 @@ WRAPI WR_ERROR_TYPE WRRotatorScan(int *number, int *ids)
     udev_list_entry_foreach(entry, devices)
     {
         const char *path = udev_list_entry_get_name(entry);
-        struct udev_device *device = udev_device_new_from_syspath(udev, path);
+        std::unique_ptr<struct udev_device, decltype(&udev_device_unref)> device(
+            udev_device_new_from_syspath(udev.get(), path), &udev_device_unref);
         if (!device)
         {
             continue;
@@ -261,11 +382,10 @@ WRAPI WR_ERROR_TYPE WRRotatorScan(int *number, int *ids)
 
         /* Get the parent USB device */
         struct udev_device *parent = udev_device_get_parent_with_subsystem_devtype(
-            device, "usb", "usb_device");
+            device.get(), "usb", "usb_device");
 
         if (!parent)
         {
-            udev_device_unref(device);
             continue;
         }
 
@@ -275,25 +395,21 @@ WRAPI WR_ERROR_TYPE WRRotatorScan(int *number, int *ids)
 
         if (!vid || !pid)
         {
-            udev_device_unref(device);
             continue;
         }
 
         if (strcmp(vid, "1a86") != 0 || strcmp(pid, "7523") != 0)
         {
-            udev_device_unref(device);
             continue;
         }
 
         /* Get the device node (e.g., /dev/ttyUSB0) */
-        const char *deviceNode = udev_device_get_devnode(device);
+        const char *deviceNode = udev_device_get_devnode(device.get());
         if (deviceNode)
         {
             WR_DEBUG("Found CH340 device: %s", deviceNode);
             candidatePorts.push_back(std::string(deviceNode));
         }
-
-        udev_device_unref(device);
     }
 
     /* Step 2: Scan candidate devices in parallel, skipping ports that already
@@ -313,7 +429,20 @@ WRAPI WR_ERROR_TYPE WRRotatorScan(int *number, int *ids)
     /* Spawn worker threads for each candidate port */
     for (auto &task : tasks)
     {
-        workerThreads.emplace_back(ScanWorkerThread, std::ref(task));
+        try
+        {
+            workerThreads.emplace_back(ScanWorkerThread, std::ref(task));
+        }
+        catch (...)
+        {
+            /* Destroying a joinable std::thread calls std::terminate - join the
+             * workers already started before letting the error propagate. */
+            for (auto &thread : workerThreads)
+            {
+                thread.join();
+            }
+            throw;
+        }
     }
 
     /* Wait for all threads to complete */
@@ -325,14 +454,32 @@ WRAPI WR_ERROR_TYPE WRRotatorScan(int *number, int *ids)
         }
     }
 
-    /* Step 3: Report already-connected devices under their existing id, and
-     * assign newly found devices the smallest id not currently in use so they
-     * never collide with (and replace) an already-registered device. */
-    for (const auto &pair : connectedPorts)
+    /* Step 3: Forget registered devices whose port has disappeared (unless the
+     * caller still has them open), report the remaining ones under their
+     * existing id, and give newly found devices the smallest free id. */
+    std::lock_guard<std::mutex> lock(g_globalMutex);
+
+    for (auto it = g_devices.begin(); it != g_devices.end();)
+    {
+        bool present = std::find(candidatePorts.begin(), candidatePorts.end(),
+                                 it->second->portName) != candidatePorts.end();
+        if (!present && !it->second->isOpen)
+        {
+            WR_DEBUG("Scan: Device id=%d on %s is gone, removing", it->first, it->second->portName.c_str());
+            it = g_devices.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    int count = 0;
+    for (const auto &pair : g_devices)
     {
         if (count >= WR_MAX_NUM)
             break;
-        ids[count] = pair.second;
+        ids[count] = pair.first;
         count++;
     }
 
@@ -350,30 +497,30 @@ WRAPI WR_ERROR_TYPE WRRotatorScan(int *number, int *ids)
         }
     }
 
-    /* Clean up udev resources */
-    udev_enumerate_unref(enumerate);
-    udev_unref(udev);
-
     *number = count;
 
     WR_INFO("Scan complete: found %d device(s)", count);
     return WR_SUCCESS;
 }
+WR_API_CATCH
 
 WRAPI WR_ERROR_TYPE WRRotatorOpen(int id)
+try
 {
-    std::lock_guard<std::mutex> lock(g_globalMutex);
     WR_DEBUG("WRRotatorOpen: Opening device id=%d", id);
 
-    auto it = g_devices.find(id);
-    if (it == g_devices.end())
+    auto device = FindDevice(id);
+    if (!device)
     {
         WR_ERROR("WRRotatorOpen: Device id=%d not found", id);
         return WR_ERROR_INVALID_ID;
     }
 
-    auto device = it->second;
     WR_DEBUG("WRRotatorOpen: Found device, portName=%s", device->portName.c_str());
+
+    /* Per-device lock only: opening can wait up to ~10s for a busy port and
+     * must not block calls on other devices. */
+    std::lock_guard<std::mutex> io(device->ioMutex);
 
     if (device->isOpen)
     {
@@ -389,7 +536,7 @@ WRAPI WR_ERROR_TYPE WRRotatorOpen(int id)
     }
 
     /* Always update retry params before open - port may have been created during
-     * scan with scan-phase params (60*50ms=3s). Open needs a longer budget to
+     * scan with scan-phase params (120*50ms=6s). Open needs a longer budget to
      * outlast the full scan+open overlap window across all SDKs.
      * 20 * 500ms = 10 seconds total wait, polling every 50ms. */
     device->port->SetRetryParams(20, 500);
@@ -402,6 +549,10 @@ WRAPI WR_ERROR_TYPE WRRotatorOpen(int id)
     }
 
     WR_DEBUG("WRRotatorOpen: Port opened successfully, performing handshake");
+
+    /* The rotator may still be moving (e.g. closed mid-move); the status query
+     * below would then end that move and start an unwanted one. */
+    StopAndDrain(device.get());
 
     /* Perform status handshake with retry mechanism */
     WR_ERROR_TYPE stat = QueryStatus(device);
@@ -418,60 +569,60 @@ WRAPI WR_ERROR_TYPE WRRotatorOpen(int id)
     WR_INFO("[OK] Rotator opened");
     return WR_SUCCESS;
 }
+WR_API_CATCH
 
 WRAPI WR_ERROR_TYPE WRRotatorClose(int id)
+try
 {
-    std::shared_ptr<Device> device;
+    auto device = FindDevice(id);
+    if (!device)
+    {
+        return WR_ERROR_INVALID_ID;
+    }
 
     {
-        std::lock_guard<std::mutex> lock(g_globalMutex);
+        /* Does not wait for a move in progress to finish (and does not stop
+         * the motor) - the listener is interrupted within one read slice. */
+        std::lock_guard<std::mutex> io(device->ioMutex);
 
-        auto it = g_devices.find(id);
-        if (it == g_devices.end())
+        StopMoveListener(device);
+
         {
-            return WR_ERROR_INVALID_ID;
+            std::lock_guard<std::mutex> lock(device->pendingMovesMutex);
+            device->pendingMoves.clear();
         }
 
-        device = it->second;
-    }
-    /* Global lock released before stopping the listener thread: StopMoveListener's
-     * join can legitimately block for up to ~90s if a move is still in progress. */
+        if (device->port)
+        {
+            device->port->Close();
+        }
 
-    {
-        std::lock_guard<std::mutex> moveLock(device->moveMutex);
-
-        /* Stop any running listener thread first */
-        StopMoveListener(device);
+        device->isOpen = false;
     }
 
-    if (device->port)
-    {
-        device->port->Close();
-    }
-
-    device->isOpen = false;
+    SetMoving(device.get(), false);
 
     WR_INFO("[OK] Rotator closed");
     return WR_SUCCESS;
 }
+WR_API_CATCH
 
 WRAPI WR_ERROR_TYPE WRRotatorGetConfig(int id, WR_ROTATOR_CONFIG *config)
+try
 {
     if (!config)
     {
         return WR_ERROR_NULL_POINTER;
     }
 
-    std::lock_guard<std::mutex> lock(g_globalMutex);
-
-    auto it = g_devices.find(id);
-    if (it == g_devices.end())
+    auto device = FindDevice(id);
+    if (!device)
     {
         return WR_ERROR_INVALID_ID;
     }
 
-    auto device = it->second;
-    config->reverseDirection = device->rotator.reverseDirection;
+    std::lock_guard<std::mutex> lock(device->stateMutex);
+    config->reverseDirection = device->reverseDirection;
     config->backlash = device->backlash / 10.0f; /* Convert from internal format */
     config->overshoot = device->overshoot;
     config->overshootAngle = device->overshootAngle;
@@ -479,56 +630,80 @@ WRAPI WR_ERROR_TYPE WRRotatorGetConfig(int id, WR_ROTATOR_CONFIG *config)
 
     return WR_SUCCESS;
 }
+WR_API_CATCH
 
-WRAPI WR_ERROR_TYPE WRRotatorSetConfig(int id, WR_ROTATOR_CONFIG *config)
+WRAPI WR_ERROR_TYPE WRRotatorSetConfig(int id, const WR_ROTATOR_CONFIG *config)
+try
 {
     if (!config)
     {
         return WR_ERROR_NULL_POINTER;
     }
 
-    std::lock_guard<std::mutex> lock(g_globalMutex);
-
-    auto it = g_devices.find(id);
-    if (it == g_devices.end())
+    auto device = FindDevice(id);
+    if (!device)
     {
         return WR_ERROR_INVALID_ID;
     }
 
-    auto device = it->second;
-
-    if (config->mask & MASK_ROTATOR_REVERSE_DIRECTION)
+    /* Validate every requested field before sending anything, so an invalid
+     * field can't leave the device with only part of the config applied.
+     * Backlash is sent as 10*x + 1600000 and must stay below the 17xxxxx
+     * reverse-direction commands. */
+    if ((config->mask & MASK_ROTATOR_BACKLASH) &&
+        !(config->backlash >= 0.0f && config->backlash < 10000.0f))
     {
-        /* Send reverse direction command: 1700000 or 1700001 */
-        const char *cmd = ReverseDirectionToCommand(config->reverseDirection);
-        if (SendCommand(device, cmd) != WR_SUCCESS)
-        {
-            return WR_ERROR_COMMUNICATION;
-        }
-
-        device->rotator.reverseDirection = config->reverseDirection;
-        device->reverseDirection = config->reverseDirection;
+        return WR_ERROR_INVALID_PARAMETER;
     }
 
-    if (config->mask & MASK_ROTATOR_BACKLASH)
+    if ((config->mask & MASK_ROTATOR_OVERSHOOT_ANGLE) &&
+        !(config->overshootAngle >= 0.0f && std::isfinite(config->overshootAngle)))
     {
-        if (config->backlash < 0.0f)
-        {
-            return WR_ERROR_INVALID_PARAMETER;
-        }
-
-        /* Send backlash command: 10*x + 1600000 */
-        int command_value = BacklashToCommand(config->backlash);
-        char cmd[32];
-        snprintf(cmd, sizeof(cmd), "%d\n", command_value);
-
-        if (SendCommand(device, cmd) != WR_SUCCESS)
-        {
-            return WR_ERROR_COMMUNICATION;
-        }
-
-        device->backlash = (int)(config->backlash * 10.0f);
+        return WR_ERROR_INVALID_PARAMETER;
     }
+
+    /* Reverse direction and backlash are stored on the device itself */
+    if (config->mask & (MASK_ROTATOR_REVERSE_DIRECTION | MASK_ROTATOR_BACKLASH))
+    {
+        auto io = LockIdle(device);
+
+        if (!device->isOpen)
+        {
+            return WR_ERROR_INVALID_STATE;
+        }
+
+        if (config->mask & MASK_ROTATOR_REVERSE_DIRECTION)
+        {
+            /* Send reverse direction command: 1700000 or 1700001 */
+            const char *cmd = ReverseDirectionToCommand(config->reverseDirection);
+            if (SendCommand(device, cmd) != WR_SUCCESS)
+            {
+                return WR_ERROR_COMMUNICATION;
+            }
+
+            std::lock_guard<std::mutex> lock(device->stateMutex);
+            device->reverseDirection = config->reverseDirection != 0;
+        }
+
+        if (config->mask & MASK_ROTATOR_BACKLASH)
+        {
+            /* Send backlash command: 10*x + 1600000 */
+            int command_value = BacklashToCommand(config->backlash);
+            char cmd[32];
+            snprintf(cmd, sizeof(cmd), "%d\n", command_value);
+
+            if (SendCommand(device, cmd) != WR_SUCCESS)
+            {
+                return WR_ERROR_COMMUNICATION;
+            }
+
+            std::lock_guard<std::mutex> lock(device->stateMutex);
+            device->backlash = command_value - 1600000;
+        }
+    }
+
+    /* Overshoot is applied by the SDK; a change takes effect from the next move */
+    std::lock_guard<std::mutex> lock(device->stateMutex);
 
     if (config->mask & MASK_ROTATOR_OVERSHOOT)
     {
@@ -538,48 +713,36 @@ WRAPI WR_ERROR_TYPE WRRotatorSetConfig(int id, WR_ROTATOR_CONFIG *config)
 
     if (config->mask & MASK_ROTATOR_OVERSHOOT_ANGLE)
     {
-        if (config->overshootAngle < 0.0f)
-        {
-            return WR_ERROR_INVALID_PARAMETER;
-        }
-
         device->overshootAngle = config->overshootAngle;
         WR_DEBUG("Set backlash overshoot to %.2f degrees", config->overshootAngle);
     }
 
     if (config->mask & MASK_ROTATOR_OVERSHOOT_DIRECTION)
     {
-        if (config->overshootDirection < 0)
-        {
-            return WR_ERROR_INVALID_PARAMETER;
-        }
-
         device->overshootDirection = config->overshootDirection != 0;
         WR_DEBUG("Set backlash overshoot direction to %d", device->overshootDirection);
     }
 
     return WR_SUCCESS;
 }
+WR_API_CATCH
 
 WRAPI WR_ERROR_TYPE WRRotatorGetStatus(int id, WR_ROTATOR_STATUS *status)
+try
 {
     if (!status)
     {
         return WR_ERROR_NULL_POINTER;
     }
 
-    std::lock_guard<std::mutex> lock(g_globalMutex);
-
-    auto it = g_devices.find(id);
-    if (it == g_devices.end())
+    auto device = FindDevice(id);
+    if (!device)
     {
         return WR_ERROR_INVALID_ID;
     }
 
-    auto device = it->second;
-
     /* If currently moving, hardware does not support fetching latest status */
-
+    std::lock_guard<std::mutex> lock(device->stateMutex);
     status->position = device->status.position;
     status->moving = device->status.moving;
     status->stepsPerRevolution = device->status.stepsPerRevolution;
@@ -587,50 +750,45 @@ WRAPI WR_ERROR_TYPE WRRotatorGetStatus(int id, WR_ROTATOR_STATUS *status)
 
     return WR_SUCCESS;
 }
+WR_API_CATCH
 
 WRAPI WR_ERROR_TYPE WRRotatorGetVersion(int id, WR_VERSION *version)
+try
 {
     if (!version)
     {
         return WR_ERROR_NULL_POINTER;
     }
 
-    std::lock_guard<std::mutex> lock(g_globalMutex);
-
-    auto it = g_devices.find(id);
-    if (it == g_devices.end())
+    auto device = FindDevice(id);
+    if (!device)
     {
         return WR_ERROR_INVALID_ID;
     }
 
-    auto device = it->second;
+    std::lock_guard<std::mutex> lock(device->stateMutex);
     version->firmware = device->firmwareVersion;
     strncpy(version->model, device->modelType.c_str(), sizeof(version->model) - 1);
     version->model[sizeof(version->model) - 1] = '\0';
 
     return WR_SUCCESS;
 }
+WR_API_CATCH
 
 WRAPI WR_ERROR_TYPE WRRotatorFindHome(int id)
+try
 {
     return WRRotatorMoveTo(id, 0.0f);
 }
+WR_API_CATCH
 
 WRAPI WR_ERROR_TYPE WRRotatorSyncPosition(int id, float angle)
+try
 {
-    std::lock_guard<std::mutex> lock(g_globalMutex);
-
-    auto it = g_devices.find(id);
-    if (it == g_devices.end())
+    auto device = FindDevice(id);
+    if (!device)
     {
         return WR_ERROR_INVALID_ID;
-    }
-
-    auto device = it->second;
-
-    if (!device->port || !device->port->IsOpen())
-    {
-        return WR_ERROR_COMMUNICATION;
     }
 
     // So far, we only support setting to zero
@@ -639,150 +797,150 @@ WRAPI WR_ERROR_TYPE WRRotatorSyncPosition(int id, float angle)
         return WR_ERROR_INVALID_PARAMETER;
     }
 
-    if (angle < 0.0f || angle >= 360.0f)
+    auto io = LockIdle(device);
+
+    if (!device->isOpen)
     {
-        return WR_ERROR_INVALID_PARAMETER;
+        return WR_ERROR_INVALID_STATE;
     }
 
     /* Set the current mechanical position as zero (home)
-     * Command: 1500002
+     * Command: 1500002 (newline-terminated so a following command can't be
+     * merged into it)
      */
-    if (SendCommand(device, "1500002") != WR_SUCCESS)
+    if (SendCommand(device, "1500002\n") != WR_SUCCESS)
     {
         return WR_ERROR_COMMUNICATION;
     }
 
     /* Update the status position to reflect the sync */
+    device->mechanicalAngle = 0;
     device->status.position = angle;
 
     return WR_SUCCESS;
 }
+WR_API_CATCH
 
 WRAPI WR_ERROR_TYPE WRRotatorMove(int id, float angle)
+try
 {
-    std::shared_ptr<Device> device;
-
+    auto device = FindDevice(id);
+    if (!device)
     {
-        std::lock_guard<std::mutex> lock(g_globalMutex);
-
-        auto it = g_devices.find(id);
-        if (it == g_devices.end())
-        {
-            return WR_ERROR_INVALID_ID;
-        }
-
-        device = it->second;
-
-        if (!device->port || !device->port->IsOpen())
-        {
-            return WR_ERROR_COMMUNICATION;
-        }
-
-        /* Reject relative moves large enough that the command value could overrun
-         * a reasonable buffer size or send a nonsensical instruction to the hardware. */
-        if (fabsf(angle) > 3600.0f)
-        {
-            return WR_ERROR_INVALID_PARAMETER;
-        }
+        return WR_ERROR_INVALID_ID;
     }
-    /* Global lock released before MoveInternal, which can legitimately block for
-     * up to ~90s (device->moveMutex) while a prior move on this device completes. */
 
-    return MoveInternal(device, angle);
+    /* Moves larger than one command can carry are split into segments; this
+     * limit only rejects nonsensical requests. */
+    if (!std::isfinite(angle) || fabsf(angle) > 3600.0f)
+    {
+        return WR_ERROR_INVALID_PARAMETER;
+    }
+
+    /* A move already in progress on this device finishes first */
+    auto io = LockIdle(device);
+
+    if (!device->isOpen)
+    {
+        return WR_ERROR_INVALID_STATE;
+    }
+
+    return MoveInternalLocked(device, angle);
 }
+WR_API_CATCH
 
 WRAPI WR_ERROR_TYPE WRRotatorMoveTo(int id, float angle)
+try
 {
-    std::shared_ptr<Device> device;
-    float delta;
-
+    auto device = FindDevice(id);
+    if (!device)
     {
-        std::lock_guard<std::mutex> lock(g_globalMutex);
-
-        auto it = g_devices.find(id);
-        if (it == g_devices.end())
-        {
-            return WR_ERROR_INVALID_ID;
-        }
-
-        device = it->second;
-
-        if (!device->port || !device->port->IsOpen())
-        {
-            return WR_ERROR_COMMUNICATION;
-        }
-
-        if (angle < 0.0f || angle >= 360.0f)
-        {
-            return WR_ERROR_INVALID_PARAMETER;
-        }
-
-        /* Perform status update */
-        RETURN_IF_ERROR(QueryStatus(device));
-
-        float currentAngle = (float)device->mechanicalAngle / 1000.0f;
-
-        /* Absolute positioning
-         * Calculate relative movement needed from current position
-         */
-        delta = angle - currentAngle;
-
-        /* Normalize delta to shortest path */
-        delta = fmodf(delta + 180.0f, 360.0f);
-        delta = (delta < 0.0f) ? delta + 180.0f : delta - 180.0f;
-
-        // Skip 0 delta
-        if (delta == 0.0f)
-        {
-            return WR_SUCCESS;
-        }
-
-        WR_DEBUG("Moving from %f by %f to %f\n", currentAngle, delta, angle);
+        return WR_ERROR_INVALID_ID;
     }
-    /* Global lock released before MoveInternal, which can legitimately block for
-     * up to ~90s (device->moveMutex) while a prior move on this device completes. */
 
-    return MoveInternal(device, delta);
+    if (!std::isfinite(angle) || angle < 0.0f || angle >= 360.0f)
+    {
+        return WR_ERROR_INVALID_PARAMETER;
+    }
+
+    /* A move already in progress on this device finishes first */
+    auto io = LockIdle(device);
+
+    if (!device->isOpen)
+    {
+        return WR_ERROR_INVALID_STATE;
+    }
+
+    /* Perform status update */
+    RETURN_IF_ERROR(QueryStatus(device));
+
+    float currentAngle = (float)device->mechanicalAngle / 1000.0f;
+
+    /* Absolute positioning
+     * Calculate relative movement needed from current position
+     */
+    float delta = angle - currentAngle;
+
+    /* Normalize delta to shortest path */
+    delta = fmodf(delta + 180.0f, 360.0f);
+    delta = (delta < 0.0f) ? delta + 180.0f : delta - 180.0f;
+
+    // Skip 0 delta
+    if (delta == 0.0f)
+    {
+        return WR_SUCCESS;
+    }
+
+    WR_DEBUG("Moving from %f by %f to %f\n", currentAngle, delta, angle);
+
+    return MoveInternalLocked(device, delta);
 }
+WR_API_CATCH
 
 WRAPI WR_ERROR_TYPE WRRotatorStopMove(int id)
+try
 {
-    std::shared_ptr<Device> device;
+    auto device = FindDevice(id);
+    if (!device)
+    {
+        return WR_ERROR_INVALID_ID;
+    }
+
+    /* ioMutex is only held for short command exchanges, never while waiting
+     * for a move, so a stop is sent promptly. */
+    std::lock_guard<std::mutex> io(device->ioMutex);
+
+    if (!device->isOpen)
+    {
+        return WR_ERROR_INVALID_STATE;
+    }
 
     {
-        std::lock_guard<std::mutex> lock(g_globalMutex);
+        /* Cancel the remaining segments (large-move chunks, overshoot return) and
+         * send "stop" under the lock the listener holds while sending a segment,
+         * so no segment can go out after the stop. */
+        std::lock_guard<std::mutex> lock(device->pendingMovesMutex);
+        device->pendingMoves.clear();
 
-        auto it = g_devices.find(id);
-        if (it == g_devices.end())
+        /* Let the listener wait only briefly for the final position */
+        if (device->listenerRunning)
         {
-            return WR_ERROR_INVALID_ID;
+            device->stopRequestedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch()).count();
         }
 
-        device = it->second;
-
-        if (!device->port || !device->port->IsOpen())
+        /* Not SendCommand: its input flush could discard the reply the
+         * listener is reading right now. */
+        const char *cmd = "stop";
+        device->port->Drain();
+        if (!device->port->Write((const unsigned char *)cmd, strlen(cmd)))
         {
             return WR_ERROR_COMMUNICATION;
         }
     }
-    /* Global lock released - only serialize against this device's own
-     * MoveInternal (moveMutex), never block on other devices. In the common
-     * case (no overlapping Move already mid-restart) this acquires instantly;
-     * sending "stop" promptly is what lets an in-flight listener's blocked
-     * read return early instead of running the full ~90s timeout. */
-    std::lock_guard<std::mutex> moveLock(device->moveMutex);
 
-    /* Send stop command */
-    if (SendCommand(device, "stop") != WR_SUCCESS)
-    {
-        return WR_ERROR_COMMUNICATION;
-    }
-
-    device->status.moving = 0;
-
-    /* Cancel any in-progress overshoot sequence so the listener doesn't fire
-     * the phase-2 "return" move after an aborted phase-1 move. */
-    device->overshooting = 0;
+    SetMoving(device.get(), false);
 
     return WR_SUCCESS;
 }
+WR_API_CATCH

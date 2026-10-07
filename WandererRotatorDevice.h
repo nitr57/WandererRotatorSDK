@@ -32,6 +32,8 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 
 #define RETURN_IF_ERROR(fct)        \
     {                               \
@@ -46,53 +48,72 @@ namespace WandererRotator
 {
     /**
      * Device represents a Wanderer Rotator device with its current state.
+     *
+     * Locking (acquire in this order, never the reverse):
+     *   g_globalMutex -> ioMutex -> pendingMovesMutex -> stateMutex
+     * g_globalMutex only guards g_devices lookups and is never held while
+     * taking a device lock. stateMutex is a leaf lock and is never held during
+     * serial I/O.
      */
     struct Device
     {
         std::shared_ptr<SerialPort> port;
         std::string portName;
+        std::atomic<bool> isOpen{false};
+
+        /* Device info and configuration - guarded by stateMutex */
         std::string modelType;
-        std::atomic<bool> isOpen{false}; /* Written outside g_globalMutex by Close, so must be atomic */
         int firmwareVersion = 0;
-        int mechanicalAngle = 0;
-        int backlash = 0;
+        int backlash = 0;               /* Backlash in tenths of a degree */
         int reverseDirection = 0;
         int stepsPerDegree = 0;
-        float lastRotated = 0.0f;
         int overshoot = 0;
         float overshootAngle = 0.0f;    /* Backlash overshoot angle in degrees */
         int overshootDirection = 0;     /* 0 - normal, 1 - reverse */
-        int overshooting = 0;           /* 0 - not in overshoot, 1 - in first phase, 2 - awaiting return */
-        float targetAngle = 0.0f;       /* Target angle for second phase of overshoot */
 
-        struct RotatorConfig
-        {
-            int reverseDirection = 0;
-            int stepRate = 50;
-        } rotator;
+        std::atomic<int> mechanicalAngle{0}; /* Written by the listener thread */
+        float lastRotated = 0.0f;            /* Only used by the listener thread */
 
         struct RotatorStatus
         {
-            float position = 0.0f;
-            int moving = 0;
-            int stepsPerRevolution = 0;
-            float stepSize = 0.0f;
+            std::atomic<float> position{0.0f}; /* Written by the listener thread */
+            std::atomic<int> moving{0};        /* Cleared through SetMoving() so waiters are notified */
+            int stepsPerRevolution = 0;        /* Guarded by stateMutex */
+            float stepSize = 0.0f;             /* Guarded by stateMutex */
         } status;
+
+        /* Guards the device info/config fields above. Also the mutex for
+         * moveDoneCv, which is notified whenever status.moving is cleared or
+         * the listener thread exits. */
+        std::mutex stateMutex;
+        std::condition_variable moveDoneCv;
+
+        /* Owns the serial port: held for every command exchange (Open, Close,
+         * Move, MoveTo, SetConfig, SyncPosition, StopMove). While a move is in
+         * progress the listener thread reads the port without it; calls that
+         * need the port wait for the move to finish first (see LockIdle in
+         * WandererRotatorSDK.cpp), so only StopMove's "stop" write and Close
+         * ever overlap with the listener. */
+        std::mutex ioMutex;
 
         /* Listener thread state */
         std::atomic<bool> listenerRunning{false};
-        std::mutex listenerMutex;
         std::thread moveListenerThread;
 
-        /* Serializes Move/MoveTo/Close's handling of moveListenerThread (i.e. the
-         * SendCommand + StartMoveListener/StopMoveListener sequence) on this device.
-         * The rotator can take up to ~90s to complete a move and stays silent on
-         * the wire the whole time, so StartMoveListener's join on the previous
-         * listener can legitimately take that long - callers must hold this
-         * per-device lock (never g_globalMutex) while it does, so other devices
-         * and quick per-device calls (StopMove, GetStatus, ...) are never blocked
-         * by it. */
-        std::mutex moveMutex;
+        /* Steps of the move segment currently running, for the reply timeout */
+        std::atomic<int> currentSegmentSteps{0};
+
+        /* Steady-clock time (ms) of a StopMove issued during the current move,
+         * 0 if none. The listener then waits only briefly for the final reply. */
+        std::atomic<long long> stopRequestedMs{0};
+
+        /* Move segments (in steps) still to be sent by the listener once the
+         * current segment completes: the remaining chunks of a move too large
+         * for a single command, followed by the overshoot return move. Guarded
+         * by pendingMovesMutex, which is also held while a segment or "stop" is
+         * written so StopMove can never race a segment out after clearing it. */
+        std::deque<int> pendingMoves;
+        std::mutex pendingMovesMutex;
 
         ~Device()
         {

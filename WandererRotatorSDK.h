@@ -29,8 +29,14 @@
 extern "C" {
 #endif
 
-#ifdef _WINDOWS
+#if defined(_WIN32)
+#if defined(WANDERER_ROTATOR_SDK_BUILD)
 #define WRAPI __declspec(dllexport)
+#else
+#define WRAPI __declspec(dllimport)
+#endif
+#elif defined(__GNUC__)
+#define WRAPI __attribute__((visibility("default")))
 #else
 #define WRAPI
 #endif
@@ -81,19 +87,24 @@ typedef struct _WR_ROTATOR_STATUS {
 } WR_ROTATOR_STATUS;
 
 /* Device scanning and management */
+/* ids must have room for WR_MAX_NUM entries; *number receives the count written */
 WRAPI WR_ERROR_TYPE WRRotatorScan(int *number, int *ids);
 WRAPI WR_ERROR_TYPE WRRotatorOpen(int id);
 WRAPI WR_ERROR_TYPE WRRotatorClose(int id);
 
 /* Configuration */
 WRAPI WR_ERROR_TYPE WRRotatorGetConfig(int id, WR_ROTATOR_CONFIG *config);
-WRAPI WR_ERROR_TYPE WRRotatorSetConfig(int id, WR_ROTATOR_CONFIG *config);
+WRAPI WR_ERROR_TYPE WRRotatorSetConfig(int id, const WR_ROTATOR_CONFIG *config);
 
 /* Status and information */
 WRAPI WR_ERROR_TYPE WRRotatorGetStatus(int id, WR_ROTATOR_STATUS *status);
 WRAPI WR_ERROR_TYPE WRRotatorGetVersion(int id, WR_VERSION *version);
 
-/* Motion control */
+/* Motion control
+ * Move, MoveTo, FindHome, SyncPosition and SetConfig (reverse direction or
+ * backlash) wait for a move already in progress on the device to finish.
+ * StopMove, Close and the Get* functions never wait. Calls on a device that
+ * is not open return WR_ERROR_INVALID_STATE. */
 WRAPI WR_ERROR_TYPE WRRotatorFindHome(int id);
 WRAPI WR_ERROR_TYPE WRRotatorSyncPosition(int id, float angle);
 WRAPI WR_ERROR_TYPE WRRotatorMove(int id, float angle);
@@ -101,6 +112,7 @@ WRAPI WR_ERROR_TYPE WRRotatorMoveTo(int id, float angle);
 WRAPI WR_ERROR_TYPE WRRotatorStopMove(int id);
 
 /* Utility */
+/* version must have room for WR_VERSION_LEN bytes */
 WRAPI WR_ERROR_TYPE WRGetSDKVersion(char *version);
 
 #ifdef __cplusplus

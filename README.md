@@ -38,38 +38,62 @@ make
 ```c
 #include "WandererRotatorSDK.h"
 #include <stdio.h>
+#include <unistd.h>
 
-int main() {
-    // Scan for devices
-    WRRotatorInfo devices[10];
-    int count = WRRotatorScan(devices, 10);
-    
-    if (count <= 0) {
+int main(void) {
+    // Scan for devices - ids must have room for WR_MAX_NUM entries
+    int ids[WR_MAX_NUM];
+    int count = 0;
+    if (WRRotatorScan(&count, ids) != WR_SUCCESS || count == 0) {
         printf("No devices found\n");
         return 1;
     }
-    
+
     // Open first device
-    int device_id = WRRotatorOpen(devices[0].port);
-    if (device_id < 0) {
+    int id = ids[0];
+    if (WRRotatorOpen(id) != WR_SUCCESS) {
         printf("Failed to open device\n");
         return 1;
     }
-    
+
     // Get device status
-    WRRotatorStatus status;
-    WRRotatorGetStatus(device_id, &status);
-    printf("Status: %s\n", status.status);
-    printf("Mechanical Position: %.1f degrees\n", status.mechanical_angle);
-    
-    // Move rotator 45 degrees
-    WRRotatorMove(device_id, 45.0);
-    
+    WR_ROTATOR_STATUS status;
+    WRRotatorGetStatus(id, &status);
+    printf("Position: %.2f degrees\n", status.position);
+
+    // Move rotator 45 degrees and wait for the move to finish
+    if (WRRotatorMove(id, 45.0f) == WR_SUCCESS) {
+        do {
+            usleep(500000);
+            WRRotatorGetStatus(id, &status);
+        } while (status.moving);
+        printf("Now at %.2f degrees\n", status.position);
+    }
+
     // Close device
-    WRRotatorClose(device_id);
-    
+    WRRotatorClose(id);
+
     return 0;
 }
+```
+
+### Run the Tests
+
+```bash
+cd build && ctest --output-on-failure
+```
+
+`test_fake_rotator` exercises the SDK against a simulated rotator on a
+pseudo-terminal - no hardware needed.
+
+Two programs test against a real device and are not run by `ctest`:
+`test_hardware` runs automated checks (moves, overshoot, stop, calls during a
+move, close/reopen mid-move, a 450 degree move) and returns the rotator to its
+starting position - **it rotates the device by up to 450 degrees, so make sure
+it can turn freely**. `test_wanderer_rotator` is an interactive test.
+
+```bash
+./test_hardware      # asks for confirmation; -y to skip
 ```
 
 ### Compile with SDK
@@ -80,71 +104,85 @@ gcc -o my_app my_app.c -lWandererRotatorSDK
 
 ## API Reference
 
+Every function returns a `WR_ERROR_TYPE`: `WR_SUCCESS` (0) on success, otherwise
+`WR_ERROR_INVALID_ID`, `WR_ERROR_INVALID_PARAMETER`, `WR_ERROR_INVALID_STATE`,
+`WR_ERROR_COMMUNICATION` or `WR_ERROR_NULL_POINTER`.
+
 ### Device Management
 
-#### `WRRotatorScan(devices, max_devices)`
-Scan for available Wanderer Rotator devices on the system.
+#### `WRRotatorScan(int *number, int *ids)`
+Scan for Wanderer Rotator devices (CH340 USB-serial adapters answering the rotator
+handshake). Devices already known to the SDK keep their id across rescans.
 
-**Parameters:**
-- `WRRotatorInfo* devices` - Array to store discovered devices
-- `int max_devices` - Maximum number of devices to return
+- `ids` - array that receives the device ids; must hold `WR_MAX_NUM` entries
+- `number` - receives the number of ids written
 
-**Returns:** Number of devices found (>= 0)
+Registered devices that have been unplugged and are not open are dropped from
+the list (their id becomes invalid).
 
-#### `WRRotatorOpen(port)`
-Open a connection to a Wanderer Rotator device.
+#### `WRRotatorOpen(int id)` / `WRRotatorClose(int id)`
+Open or close the serial connection to a scanned device. Closing does not stop a
+move that is in progress. Opening fails quickly with an error logged if the user
+lacks permission for the serial port (on most distributions: not in the `dialout`
+group).
 
-**Parameters:**
-- `const char* port` - Serial port path (e.g., "/dev/ttyUSB0")
+### Moves in Progress
 
-**Returns:** Device ID (>= 0 on success, < 0 on error)
+Moves run in the background. While one is in progress, `WRRotatorMove`,
+`WRRotatorMoveTo`, `WRRotatorFindHome`, `WRRotatorSyncPosition` and
+`WRRotatorSetConfig` (reverse direction or backlash) wait for it to finish
+before running. `WRRotatorStopMove`, `WRRotatorClose` and the `Get` functions
+never wait. Calls that need an open device return `WR_ERROR_INVALID_STATE`
+when it is not open.
 
-#### `WRRotatorClose(device_id)`
-Close connection to a device and clean up resources.
+### Configuration
 
-**Parameters:**
-- `int device_id` - Device ID from WRRotatorOpen
+#### `WRRotatorGetConfig(int id, WR_ROTATOR_CONFIG *config)`
+#### `WRRotatorSetConfig(int id, const WR_ROTATOR_CONFIG *config)`
+`config->mask` selects which fields `WRRotatorSetConfig` applies
+(`MASK_ROTATOR_REVERSE_DIRECTION`, `MASK_ROTATOR_BACKLASH`, `MASK_ROTATOR_OVERSHOOT`,
+`MASK_ROTATOR_OVERSHOOT_ANGLE`, `MASK_ROTATOR_OVERSHOOT_DIRECTION`, or
+`MASK_ROTATOR_ALL`). All selected fields are validated before anything is sent to
+the device.
 
-**Returns:** 0 on success, < 0 on error
+- `reverseDirection` - reverse the motor direction (stored on the device)
+- `backlash` - backlash in degrees (stored on the device)
+- `overshoot`, `overshootAngle`, `overshootDirection` - software backlash
+  compensation: moves in the selected direction (`overshootDirection` 0 -
+  positive/counterclockwise, non-zero - negative/clockwise) go `overshootAngle`
+  past the target and then return to it
 
-### Movement Control
+### Status and Information
 
-#### `WRRotatorMove(device_id, degrees)`
-Rotate the device by the specified number of degrees (relative movement).
+#### `WRRotatorGetStatus(int id, WR_ROTATOR_STATUS *status)`
+Current `position` in degrees, `moving` flag, `stepsPerRevolution` and `stepSize`.
+Moves run in the background; poll `moving` to wait for completion.
 
-**Parameters:**
-- `int device_id` - Device ID
-- `double degrees` - Degrees to rotate (-360 to 360)
+#### `WRRotatorGetVersion(int id, WR_VERSION *version)`
+Firmware version and model name.
 
-**Returns:** 0 on success, < 0 on error
+#### `WRGetSDKVersion(char *version)`
+SDK version string; `version` must hold `WR_VERSION_LEN` bytes.
 
-#### `WRRotatorMoveTo(device_id, degrees)`
-Rotate the device to an absolute position.
+### Motion Control
 
-**Parameters:**
-- `int device_id` - Device ID
-- `double degrees` - Target angle in degrees (0-360)
+#### `WRRotatorMove(int id, float angle)`
+Rotate by `angle` degrees relative to the current position (-3600 to 3600;
+positive is counterclockwise). Returns as soon as the move has started. Moves
+larger than one device command can carry (about 417 degrees) are sent as
+consecutive segments.
 
-**Returns:** 0 on success, < 0 on error
+#### `WRRotatorMoveTo(int id, float angle)`
+Rotate to the absolute position `angle` (0 to <360) along the shortest path.
 
-### Status and Monitoring
+#### `WRRotatorFindHome(int id)`
+Move to position 0.
 
-#### `WRRotatorGetStatus(device_id, status)`
-Get current device status and position.
+#### `WRRotatorSyncPosition(int id, float angle)`
+Define the current position as `angle`. Only 0 is currently supported.
 
-**Parameters:**
-- `int device_id` - Device ID
-- `WRRotatorStatus* status` - Pointer to status structure
-
-**Returns:** 0 on success, < 0 on error
-
-#### `WRRotatorIsMoving(device_id)`
-Check if device is currently moving.
-
-**Parameters:**
-- `int device_id` - Device ID
-
-**Returns:** 1 if moving, 0 if idle, < 0 on error
+#### `WRRotatorStopMove(int id)`
+Stop the current move, including any pending overshoot return.
 
 ## License
 
@@ -164,5 +202,4 @@ For issues, questions, or suggestions, please open an issue on the project repos
 
 ---
 
-**Version:** 1.2.0  
-**Last Updated:** December 2025
+**Version:** 1.5.0

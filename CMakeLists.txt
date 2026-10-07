@@ -23,44 +23,73 @@
 # ###############################################################################
 
 cmake_minimum_required(VERSION 3.22)
-project(WandererRotatorSDK VERSION 1.4.0 DESCRIPTION "Wanderer Rotator SDK for telescope control")
+project(WandererRotatorSDK VERSION 1.5.0 DESCRIPTION "Wanderer Rotator SDK for telescope control")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+	set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+option(WANDERER_ROTATOR_BUILD_TESTS "Build the interactive and automated test programs" ON)
+
+# std::thread needs pthreads linked explicitly on glibc < 2.34
+find_package(Threads REQUIRED)
 
 # Find libudev package
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBUDEV libudev)
 
-# SDK Library
-add_library(WandererRotatorSDK SHARED 
-	WandererRotatorSDK.cpp 
-	WandererRotatorLogging.cpp 
+if(NOT LIBUDEV_FOUND)
+	message(FATAL_ERROR "libudev not found. Install it with: sudo apt-get install libudev-dev")
+endif()
+
+set(WANDERER_ROTATOR_SOURCES
+	WandererRotatorSDK.cpp
+	WandererRotatorLogging.cpp
 	WandererRotatorSerialPort.cpp
 	WandererRotatorDevice.cpp
 	WandererRotatorProtocol.cpp)
 
-# Public headers
+# SDK Library - only the C API in WandererRotatorSDK.h is exported
+add_library(WandererRotatorSDK SHARED ${WANDERER_ROTATOR_SOURCES})
 target_include_directories(WandererRotatorSDK PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(WandererRotatorSDK PRIVATE ${LIBUDEV_INCLUDE_DIRS})
+target_link_libraries(WandererRotatorSDK PRIVATE Threads::Threads ${LIBUDEV_LIBRARIES})
+target_compile_definitions(WandererRotatorSDK PRIVATE WANDERER_ROTATOR_SDK_BUILD)
+target_compile_options(WandererRotatorSDK PRIVATE -Wall -Wextra)
+set_target_properties(WandererRotatorSDK PROPERTIES
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	VERSION ${PROJECT_VERSION}
+	SOVERSION ${PROJECT_VERSION_MAJOR})
 
-# Link libudev
-if(LIBUDEV_FOUND)
-	target_include_directories(WandererRotatorSDK PRIVATE ${LIBUDEV_INCLUDE_DIRS})
-	target_link_libraries(WandererRotatorSDK PRIVATE ${LIBUDEV_LIBRARIES})
-else()
-	message(FATAL_ERROR "libudev not found. Install it with: sudo apt-get install libudev-dev")
+if(WANDERER_ROTATOR_BUILD_TESTS)
+	# Interactive test against real hardware
+	add_executable(test_wanderer_rotator test_wanderer_rotator.cpp)
+	target_link_libraries(test_wanderer_rotator WandererRotatorSDK)
+
+	# Automated tests against a simulated rotator on a pseudo-terminal. Built
+	# from the sources directly since it needs the (hidden) internal API.
+	enable_testing()
+	add_executable(test_fake_rotator tests/test_fake_rotator.cpp ${WANDERER_ROTATOR_SOURCES})
+	target_include_directories(test_fake_rotator PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${LIBUDEV_INCLUDE_DIRS})
+	target_link_libraries(test_fake_rotator PRIVATE Threads::Threads ${LIBUDEV_LIBRARIES})
+	add_test(NAME fake_rotator COMMAND test_fake_rotator)
+	set_tests_properties(fake_rotator PROPERTIES TIMEOUT 120)
+
+	# Automated tests against a real rotator - moves it, so not part of ctest
+	add_executable(test_hardware tests/test_hardware.c)
+	target_link_libraries(test_hardware WandererRotatorSDK m)
 endif()
-
-# Test executable
-add_executable(test_wanderer_rotator test_wanderer_rotator.cpp)
-target_link_libraries(test_wanderer_rotator WandererRotatorSDK)
 
 # Installation
 install(TARGETS WandererRotatorSDK
 	LIBRARY DESTINATION lib
 	ARCHIVE DESTINATION lib
 )
-install(FILES WandererRotatorSDK.h WandererRotatorLogging.h WandererRotatorSerialPort.h WandererRotatorDevice.h WandererRotatorProtocol.h DESTINATION include)
+install(FILES WandererRotatorSDK.h DESTINATION include)
 # CPack configuration for Debian package generation
 set(CPACK_GENERATOR "DEB")
 set(CPACK_PACKAGE_CONTACT "Nico")

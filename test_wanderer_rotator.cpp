@@ -31,10 +31,9 @@
 bool WaitForRotatorReady(int deviceId, int maxWaitSeconds = 120)
 {
     WR_ROTATOR_STATUS status;
-    int elapsed = 0;
-    int noResponseCount = 0;
+    int elapsed = 0; /* in 0.5 second ticks */
 
-    while (elapsed < maxWaitSeconds)
+    while (elapsed < maxWaitSeconds * 2)
     {
         usleep(500000); /* 0.5 second */
         elapsed++;
@@ -53,8 +52,6 @@ bool WaitForRotatorReady(int deviceId, int maxWaitSeconds = 120)
             printf("    Movement completed after %d.%d seconds\n", elapsed / 2, (elapsed % 2) * 5);
             return true;
         }
-
-        noResponseCount++;
     }
 
     printf("    [TIMEOUT] Movement did not complete within %d seconds\n", maxWaitSeconds);
@@ -239,12 +236,10 @@ int main(int argc, char *argv[])
             else
             {
                 printf("[OK] Movement command sent\n");
-                while (!WaitForRotatorReady(deviceId))
+                if (WaitForRotatorReady(deviceId))
                 {
-                    sleep(1);
+                    printf("[OK] Movement completed\n");
                 }
-
-                printf("[OK] Movement completed\n");
             }
             break;
         }

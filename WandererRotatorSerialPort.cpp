@@ -31,7 +31,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #endif
 #include <cerrno>
@@ -65,6 +65,9 @@ namespace WandererRotator
     bool SerialPort::Open(const char *portName)
     {
         WR_DEBUG("SerialPort::Open: Attempting to open %s", portName);
+
+        /* Never leak a previously opened descriptor */
+        Close();
 #ifdef _WIN32
         std::string device = ToDevicePath(portName);
 
@@ -136,15 +139,26 @@ namespace WandererRotator
 
         while (open_fd < 0 && totalWaitMs < totalTimeoutMs)
         {
-            open_fd = open(portName, O_RDWR | O_NOCTTY);
+            open_fd = open(portName, O_RDWR | O_NOCTTY | O_CLOEXEC);
             WR_DEBUG("SerialPort::Open: Attempt %d, open() returned fd=%d, elapsed=%dms",
                      attempt + 1, open_fd, totalWaitMs);
 
             if (open_fd < 0)
             {
                 int last_errno = errno;
+                /* EACCES is usually permanent (user not in the "dialout" group), but
+                 * right after the device is plugged in udev may not have applied its
+                 * permissions yet, so give it a short grace period only. */
+                const int permissionGraceMs = 1000;
+                if (last_errno == EACCES && totalWaitMs >= permissionGraceMs)
+                {
+                    WR_ERROR("SerialPort::Open: Permission denied opening %s - "
+                             "is the user in the 'dialout' group?", portName);
+                    return false;
+                }
+
                 /* EBUSY: port held exclusively by another process (TIOCEXCL)
-                 * EAGAIN/EACCES: temporarily unavailable - all worth waiting for */
+                 * EAGAIN/EACCES: temporarily unavailable - worth waiting for */
                 if (last_errno == EBUSY || last_errno == EAGAIN || last_errno == EACCES)
                 {
                     WR_DEBUG("SerialPort::Open: Port busy (errno=%d), polling in %dms (elapsed=%dms, timeout=%dms)...",
@@ -269,14 +283,14 @@ namespace WandererRotator
         }
         WR_DEBUG("SerialPort::Open: tcsetattr succeeded");
 
-        tcflush(fd, TCIOFLUSH);
+        tcflush((int)fd, TCIOFLUSH);
 
         /* Allow the USB-serial adapter and MCU to settle after port open.
          * CH340-based devices may trigger a microcontroller reset on the first
          * open after a fresh USB plug-in. The bootloader typically needs
          * ~200-500ms before the application firmware starts responding. */
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        tcflush(fd, TCIOFLUSH);
+        tcflush((int)fd, TCIOFLUSH);
 
         WR_DEBUG("SerialPort::Open: Successfully opened %s (fd=%d)", portName, (int)fd);
 #endif
@@ -285,15 +299,14 @@ namespace WandererRotator
 
     void SerialPort::Close()
     {
-        if (fd != -1)
+        intptr_t oldFd = fd.exchange(-1);
+        if (oldFd != -1)
         {
 #ifdef _WIN32
-            HANDLE h = (HANDLE)fd;
-            CloseHandle(h);
+            CloseHandle((HANDLE)oldFd);
 #else
-            close((int)fd);
+            close((int)oldFd);
 #endif
-            fd = -1;
         }
 
         /* Clear the receive buffer when port is closed to prevent stale data from
@@ -312,7 +325,7 @@ namespace WandererRotator
         }
 
 #ifdef _WIN32
-        HANDLE h = (HANDLE)fd;
+        HANDLE h = (HANDLE)(intptr_t)fd;
         DWORD written = 0;
         if (!WriteFile(h, data, (DWORD)len, &written, NULL))
         {
@@ -320,7 +333,19 @@ namespace WandererRotator
             return false;
         }
 #else
-        int written = write((int)fd, data, len);
+        int written = 0;
+        while (written < len)
+        {
+            ssize_t n = write((int)fd, data + written, len - written);
+            if (n < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                WR_DEBUG("Write: fd=%d, write failed (errno=%d)", (int)fd, errno);
+                break;
+            }
+            written += (int)n;
+        }
         WR_DEBUG("Write: fd=%d, wrote %d/%d bytes", (int)fd, written, len);
 #endif
 
@@ -331,13 +356,31 @@ namespace WandererRotator
 
     int SerialPort::Read(unsigned char *buf, int maxlen, char stop_char, int timeoutMs)
     {
+        return ReadImpl(buf, maxlen, stop_char, timeoutMs, true, nullptr);
+    }
+
+    int SerialPort::ReadMessage(unsigned char *buf, int maxlen, char stop_char, int timeoutMs, bool &ioError)
+    {
+        ioError = false;
+        return ReadImpl(buf, maxlen, stop_char, timeoutMs, false, &ioError);
+    }
+
+    int SerialPort::ReadImpl(unsigned char *buf, int maxlen, char stop_char, int timeoutMs,
+                             bool returnPartial, bool *ioError)
+    {
+        if (maxlen >= 1)
+            buf[0] = '\0';
         if (fd == -1 || maxlen <= 1)
+        {
+            if (ioError && fd == -1)
+                *ioError = true;
             return 0;
+        }
 
 #ifdef _WIN32
-        HANDLE h = (HANDLE)fd;
+        HANDLE h = (HANDLE)(intptr_t)fd;
 #endif
-        auto start = std::chrono::high_resolution_clock::now();
+        auto start = std::chrono::steady_clock::now();
 
         /* Temporary read buffer */
         unsigned char tmp[512];
@@ -345,7 +388,7 @@ namespace WandererRotator
         while (true)
         {
             /* Check remaining time */
-            auto elapsed = std::chrono::high_resolution_clock::now() - start;
+            auto elapsed = std::chrono::steady_clock::now() - start;
             int elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
             int remainingMs = timeoutMs - elapsedMs;
             if (remainingMs <= 0)
@@ -395,17 +438,29 @@ namespace WandererRotator
                 break;
             }
 #else
-            fd_set readfds;
-            FD_ZERO(&readfds);
-            FD_SET((int)fd, &readfds);
+            struct pollfd pfd = {(int)fd, POLLIN, 0};
+            int pollResult = poll(&pfd, 1, remainingMs);
+            if (pollResult < 0 && errno == EINTR)
+                continue; /* interrupted by a signal - recompute remaining time and retry */
+            if (pollResult < 0)
+            {
+                if (ioError)
+                    *ioError = true;
+                break;
+            }
+            if (pollResult == 0)
+                break; /* timeout */
 
-            struct timeval tv;
-            tv.tv_sec = remainingMs / 1000;
-            tv.tv_usec = (remainingMs % 1000) * 1000;
-
-            int selectResult = select((int)fd + 1, &readfds, NULL, NULL, &tv);
-            if (selectResult <= 0)
-                break; /* timeout or error */
+            /* A USB-serial adapter that was unplugged hangs up the tty: poll reports
+             * it as readable forever while read() returns 0, so bail out instead of
+             * spinning until the timeout. */
+            if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))
+            {
+                WR_DEBUG("SerialPort::Read: port hung up or errored (revents=0x%x)", pfd.revents);
+                if (ioError)
+                    *ioError = true;
+                break;
+            }
 
             /* Find how many bytes are available to read */
             int avail = 0;
@@ -422,6 +477,8 @@ namespace WandererRotator
             {
                 if (errno == EINTR || errno == EAGAIN)
                     continue;
+                if (ioError)
+                    *ioError = true;
                 break;
             }
 #endif
@@ -438,6 +495,7 @@ namespace WandererRotator
         }
 
         /* On timeout, return any buffered partial data (if available) */
+        if (returnPartial)
         {
             std::lock_guard<std::mutex> lock(rxMutex);
             size_t copyLen = std::min((size_t)maxlen - 1, rxBuffer.size());
@@ -459,7 +517,7 @@ namespace WandererRotator
         if (fd != -1)
         {
 #ifdef _WIN32
-            HANDLE h = (HANDLE)fd;
+            HANDLE h = (HANDLE)(intptr_t)fd;
             PurgeComm(h, PURGE_RXCLEAR | PURGE_TXCLEAR);
 #else
             tcflush((int)fd, TCIOFLUSH);
@@ -472,7 +530,7 @@ namespace WandererRotator
         if (fd != -1)
         {
 #ifdef _WIN32
-            HANDLE h = (HANDLE)fd;
+            HANDLE h = (HANDLE)(intptr_t)fd;
             // Wait briefly; FlushFileBuffers already used after write
             FlushFileBuffers(h);
 #else

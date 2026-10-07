@@ -260,9 +260,9 @@ try
     auto port = std::make_shared<SerialPort>();
     
     /* Allow up to ~6 seconds for competing SDK scans to release the port.
-     * Each competing scan holds a port for up to ~1s (handshake timeout).
+     * Each competing scan holds a port for up to ~1.5s (see ProbeStatus).
      * With multiple SDKs scanning simultaneously, worst case is several
-     * sequential 1s holds before we get a window. Workers run in parallel
+     * sequential holds before we get a window. Workers run in parallel
      * so this does not multiply scan duration across ports. */
     port->SetRetryParams(120, 50);  /* 120 * 50ms = 6000ms total timeout, 50ms poll interval */
     
@@ -276,8 +276,8 @@ try
     tempDevice->port = port;
     tempDevice->portName = task.portName;
 
-    /* Perform status handshake with retry mechanism */
-    WR_ERROR_TYPE stat = QueryStatus(tempDevice);
+    /* Quick handshake - a device that stays silent is released after ~1.5s */
+    WR_ERROR_TYPE stat = ProbeStatus(tempDevice);
 
     if(stat != WR_SUCCESS)
     {

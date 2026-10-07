@@ -63,7 +63,9 @@ static const int kStepsPerDegree = 1199; /* LiteV2 */
  *   move ("runaway"); "stop" does not.
  * - A move command without '\n' only runs after ~1s without further input, so
  *   anything sent in that window is merged into it.
- * - "stop" while idle and zero-step moves get no answer. */
+ * - "stop" while idle and zero-step moves get no answer.
+ * - After power-up the firmware ignores all input for a while (measured:
+ *   ~450ms after the port is first opened); see bootMs. */
 struct FakeRotator
 {
     int master = -1;
@@ -77,6 +79,8 @@ struct FakeRotator
     std::atomic<bool> garbled{false};   /* send junk when a move starts */
     std::atomic<int> reverse{0};
     std::atomic<int> startMovingMs{0};  /* start a move of this duration, as if commanded earlier */
+    std::atomic<int> bootMs{0};         /* ignore all input for this long after creation */
+    steady_clock::time_point created = steady_clock::now();
 
     /* State, owned by the fake's thread unless noted */
     std::atomic<int> mech{90000};       /* thousandths of a degree */
@@ -255,6 +259,11 @@ struct FakeRotator
 
             if (acc.empty())
                 continue;
+            if (steady_clock::now() < created + milliseconds(bootMs.load()))
+            {
+                acc.clear(); /* still booting */
+                continue;
+            }
             long quietMs = (long)duration_cast<milliseconds>(steady_clock::now() - lastByte).count();
             if (moving)
             {
@@ -672,6 +681,41 @@ static void TestPermissionDenied()
     chmod(fake.slavePath.c_str(), 0620);
 }
 
+/* The handshake WRRotatorScan uses on a port (scanning itself needs udev and
+ * a real CH340 adapter): open the port as a scan worker does, then probe. */
+static bool ProbeLikeScan(FakeRotator &fake, long &elapsedMs)
+{
+    auto device = std::make_shared<Device>();
+    device->portName = fake.slavePath;
+    device->port = std::make_shared<SerialPort>();
+    auto start = steady_clock::now();
+    bool ok = device->port->Open(fake.slavePath.c_str()) && ProbeStatus(device) == WR_SUCCESS;
+    elapsedMs = ElapsedMs(start);
+    device->port->Close();
+    return ok;
+}
+
+static void TestScanProbe()
+{
+    long ms;
+    {
+        FakeRotator fake;
+        CHECK(ProbeLikeScan(fake, ms), "booted rotator found in %ld ms", ms);
+        CHECK(ms < 900, "quick when the rotator answers at once");
+    }
+    {
+        FakeRotator fake;
+        fake.bootMs = 1100; /* ~2.5x the measured boot time */
+        CHECK(ProbeLikeScan(fake, ms), "freshly plugged-in rotator (1.1s boot) found in %ld ms", ms);
+    }
+    {
+        FakeRotator fake;
+        fake.bootMs = 60000; /* never answers: some other CH340 device */
+        CHECK(!ProbeLikeScan(fake, ms), "silent device rejected");
+        CHECK(ms < 1700, "silent port released after %ld ms", ms);
+    }
+}
+
 static void TestVersion()
 {
     char buf[64];
@@ -708,6 +752,7 @@ int main(int argc, char **argv)
         {"commands-during-move", TestCommandsDuringMove},
         {"not-open", TestNotOpen},
         {"permission", TestPermissionDenied},
+        {"scan-probe", TestScanProbe},
         {"version", TestVersion},
     };
 

@@ -45,7 +45,18 @@ namespace WandererRotator
      * Query model, firmware, position, backlash and reverse direction from the
      * device and store them in the Device. Retries missing or unparseable replies.
      */
-    WR_ERROR_TYPE QueryStatus(std::shared_ptr<Device> device);
+    WR_ERROR_TYPE QueryStatus(std::shared_ptr<Device> device, int maxAttempts = 3,
+                              int recvTimeoutMs = 500, int retryDelayMs = 300);
+
+    /**
+     * Handshake used by WRRotatorScan to identify a freshly opened port: asks
+     * for the status every 250ms until 1.5s after the port was opened (incl.
+     * SerialPort::Open's 500ms settle). A rotator that was just plugged in
+     * answers ~450ms after open (it ignores queries while booting); ports that
+     * stay silent are released quickly so other programs waiting on them can
+     * proceed.
+     */
+    WR_ERROR_TYPE ProbeStatus(std::shared_ptr<Device> device);
 
     /**
      * Convert backlash value to command value.

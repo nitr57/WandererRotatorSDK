@@ -136,7 +136,12 @@ namespace WandererRotator
         return WR_SUCCESS;
     }
 
-    WR_ERROR_TYPE QueryStatus(std::shared_ptr<Device> device)
+    WR_ERROR_TYPE ProbeStatus(std::shared_ptr<Device> device)
+    {
+        return QueryStatus(device, 4, 250, 0);
+    }
+
+    WR_ERROR_TYPE QueryStatus(std::shared_ptr<Device> device, int maxAttempts, int recvTimeoutMs, int retryDelayMs)
     {
         if (!device)
         {
@@ -149,16 +154,15 @@ namespace WandererRotator
         }
 
         /* Retry both missing and unparseable (e.g. truncated) replies */
-        const int maxAttempts = 3;
         for (int attempt = 1; attempt <= maxAttempts; ++attempt)
         {
-            if (attempt > 1)
+            if (attempt > 1 && retryDelayMs > 0)
             {
-                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                std::this_thread::sleep_for(std::chrono::milliseconds(retryDelayMs));
             }
 
             char response[64];
-            if (SendAndWaitForReply(device, "1500001\n", response, sizeof(response), 500) != WR_SUCCESS)
+            if (SendAndWaitForReply(device, "1500001\n", response, sizeof(response), recvTimeoutMs) != WR_SUCCESS)
             {
                 WR_DEBUG("QueryStatus: No reply on attempt %d/%d", attempt, maxAttempts);
                 continue;

@@ -29,6 +29,9 @@
 #include <cstdint>
 #include <string>
 #include <mutex>
+#ifndef _WIN32
+#include <termios.h>
+#endif
 
 /* ============================================================================
  * WANDERER ROTATOR SDK - SERIAL PORT MODULE
@@ -49,6 +52,12 @@ namespace WandererRotator
 
         int ReadImpl(unsigned char *buf, int maxlen, char stop_char, int timeoutMs,
                      bool returnPartial, bool *ioError);
+
+#ifndef _WIN32
+        struct termios originalSettings; /* port settings before Open changed them */
+        bool haveOriginalSettings = false;
+        int inUseLockFd = -1;            /* held lock on the port's in-use marker, see MarkInUse */
+#endif
 
     public:
         SerialPort() {}
@@ -81,6 +90,32 @@ namespace WandererRotator
          * Close the serial port.
          */
         void Close();
+
+        /**
+         * Mark the port as in use (opened for a device, not just probed) until it
+         * is closed: holds an advisory lock on /tmp/ch34x-<port name>.lock (e.g.
+         * /tmp/ch34x-ttyUSB0.lock). Open() fails at once instead of waiting for a
+         * busy port whose marker is held. The convention is shared with other
+         * SDKs for CH34x-based devices, so their scans skip ports in use as well.
+         * The lock is released by Close() or when the process exits.
+         * @param portName Device path the port was opened with
+         */
+        void MarkInUse(const char *portName);
+
+        /**
+         * Put back the port settings found when it was opened (baud rate, mode),
+         * except that hang-up-on-close stays off so closing does not toggle DTR.
+         * Used after probing a port that turned out to belong to another device,
+         * which may be in use by another program.
+         */
+        void RestoreOriginalSettings();
+
+        /**
+         * Check whether the port has been hung up, e.g. because the USB device
+         * was unplugged. Does not consume any data.
+         * @return true if the port is open but no longer usable
+         */
+        bool IsHungUp();
 
         /**
          * Write data to the serial port.

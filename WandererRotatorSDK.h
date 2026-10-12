@@ -43,6 +43,7 @@ extern "C" {
 
 #define WR_MAX_NUM          32      /* Maximum rotator numbers supported by this SDK */
 #define WR_VERSION_LEN      32      /* Buffer length for version strings */
+#define WR_PORT_LEN         256     /* Buffer length for port names */
 
 typedef enum _WR_ERROR_TYPE {
     WR_SUCCESS = 0,                     /* Success */
@@ -89,10 +90,25 @@ typedef struct _WR_ROTATOR_STATUS {
 /* Device scanning and management */
 /* ids must have room for WR_MAX_NUM entries; *number receives the count written */
 WRAPI WR_ERROR_TYPE WRRotatorScan(int *number, int *ids);
+/* Probes only the given port (as returned by WRRotatorGetPort, or a device
+ * node such as /dev/ttyUSB0) instead of all CH340 ports, so no other device
+ * is touched. *id receives the device's id; a device already registered on
+ * that port keeps its id and is not probed again. Returns
+ * WR_ERROR_COMMUNICATION if no rotator answers there - fall back to
+ * WRRotatorScan then. */
+WRAPI WR_ERROR_TYPE WRRotatorScanPort(const char *port, int *id);
+/* port must have room for WR_PORT_LEN bytes. Receives the device's
+ * /dev/serial/by-path/... link, which stays the same across reconnects and
+ * reboots as long as the rotator is plugged into the same USB socket, or its
+ * device node if there is no such link. The CH340 has no USB serial number,
+ * so /dev/serial/by-id/... cannot tell two such devices apart. */
+WRAPI WR_ERROR_TYPE WRRotatorGetPort(int id, char *port);
 WRAPI WR_ERROR_TYPE WRRotatorOpen(int id);
 WRAPI WR_ERROR_TYPE WRRotatorClose(int id);
 
-/* Configuration */
+/* Configuration
+ * WRRotatorGetConfig sets config->mask to 0; set the bits of the fields to
+ * change before passing the struct to WRRotatorSetConfig. */
 WRAPI WR_ERROR_TYPE WRRotatorGetConfig(int id, WR_ROTATOR_CONFIG *config);
 WRAPI WR_ERROR_TYPE WRRotatorSetConfig(int id, const WR_ROTATOR_CONFIG *config);
 
@@ -104,7 +120,9 @@ WRAPI WR_ERROR_TYPE WRRotatorGetVersion(int id, WR_VERSION *version);
  * Move, MoveTo, FindHome, SyncPosition and SetConfig (reverse direction or
  * backlash) wait for a move already in progress on the device to finish.
  * StopMove, Close and the Get* functions never wait. Calls on a device that
- * is not open return WR_ERROR_INVALID_STATE. */
+ * is not open return WR_ERROR_INVALID_STATE; calls on an open device whose
+ * USB connection was lost return WR_ERROR_COMMUNICATION until it is reopened
+ * (WRRotatorOpen reconnects). */
 WRAPI WR_ERROR_TYPE WRRotatorFindHome(int id);
 WRAPI WR_ERROR_TYPE WRRotatorSyncPosition(int id, float angle);
 WRAPI WR_ERROR_TYPE WRRotatorMove(int id, float angle);

@@ -32,6 +32,10 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <poll.h>
+#include <climits>
+#include <cstdlib>
+#include <string>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #endif
 #include <cerrno>
@@ -59,6 +63,33 @@ namespace WandererRotator
         if (s.rfind("COM", 0) == 0)
             return s;
         return s; // fallback
+    }
+#endif
+
+#ifndef _WIN32
+    /* Path of the in-use marker for a port: /tmp/ch34x-<port name>.lock, named
+     * after the real device node so a symlink (/dev/serial/by-id/...) maps to
+     * the same marker */
+    static std::string InUseMarkerPath(const char *portName)
+    {
+        char resolved[PATH_MAX];
+        const char *path = realpath(portName, resolved) ? resolved : portName;
+        const char *name = strrchr(path, '/');
+        return std::string("/tmp/ch34x-") + (name ? name + 1 : path) + ".lock";
+    }
+
+    /* True if another process holds the port's in-use marker, i.e. the port is
+     * open for use rather than just being probed by a scan */
+    static bool IsMarkedInUse(const char *portName)
+    {
+        int lockFd = open(InUseMarkerPath(portName).c_str(), O_RDONLY | O_CLOEXEC);
+        if (lockFd < 0)
+        {
+            return false;
+        }
+        bool held = flock(lockFd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+        close(lockFd);
+        return held;
     }
 #endif
 
@@ -130,7 +161,11 @@ namespace WandererRotator
         /* Try to open with polling retry logic for busy ports.
          * There is no kernel mechanism to wait for TIOCEXCL release, so we
          * poll at a short fixed interval until the port becomes available or
-         * we exceed the total timeout budget. */
+         * we exceed the total timeout budget.
+         *
+         * O_NONBLOCK: without it, open() waits for carrier detect forever if a
+         * previous user left CLOCAL cleared on the tty. It is removed again once
+         * the port is configured. */
         int open_fd = -1;
         int attempt = 0;
         int totalWaitMs = 0;
@@ -139,9 +174,20 @@ namespace WandererRotator
 
         while (open_fd < 0 && totalWaitMs < totalTimeoutMs)
         {
-            open_fd = open(portName, O_RDWR | O_NOCTTY | O_CLOEXEC);
+            open_fd = open(portName, O_RDWR | O_NOCTTY | O_CLOEXEC | O_NONBLOCK);
             WR_DEBUG("SerialPort::Open: Attempt %d, open() returned fd=%d, elapsed=%dms",
                      attempt + 1, open_fd, totalWaitMs);
+
+            /* Also honour advisory locks, as taken e.g. by pyserial's
+             * exclusive mode, so a port in use by another program is treated
+             * as busy rather than probed. */
+            if (open_fd >= 0 && flock(open_fd, LOCK_EX | LOCK_NB) != 0)
+            {
+                int lockErrno = errno;
+                close(open_fd);
+                open_fd = -1;
+                errno = lockErrno == EWOULDBLOCK ? EBUSY : lockErrno;
+            }
 
             if (open_fd < 0)
             {
@@ -154,6 +200,14 @@ namespace WandererRotator
                 {
                     WR_ERROR("SerialPort::Open: Permission denied opening %s - "
                              "is the user in the 'dialout' group?", portName);
+                    return false;
+                }
+
+                /* A busy port that is open for use will not become free soon -
+                 * only wait for ports that are busy because they are being probed */
+                if (last_errno == EBUSY && IsMarkedInUse(portName))
+                {
+                    WR_DEBUG("SerialPort::Open: %s is in use by another program, skipping", portName);
                     return false;
                 }
 
@@ -202,6 +256,8 @@ namespace WandererRotator
             fd = -1;
             return false;
         }
+        originalSettings = tty;
+        haveOriginalSettings = true;
 
         /* Set 19200 baud rate */
         cfsetispeed(&tty, B19200);
@@ -283,6 +339,13 @@ namespace WandererRotator
         }
         WR_DEBUG("SerialPort::Open: tcsetattr succeeded");
 
+        /* Back to blocking writes now that CLOCAL is set */
+        int flags = fcntl(open_fd, F_GETFL);
+        if (flags >= 0)
+        {
+            fcntl(open_fd, F_SETFL, flags & ~O_NONBLOCK);
+        }
+
         tcflush((int)fd, TCIOFLUSH);
 
         /* Allow the USB-serial adapter and MCU to settle after port open.
@@ -305,9 +368,21 @@ namespace WandererRotator
 #ifdef _WIN32
             CloseHandle((HANDLE)oldFd);
 #else
+            /* TIOCEXCL belongs to the tty, not to this descriptor: clear it so it
+             * doesn't outlive us if another program also has the port open */
+            ioctl((int)oldFd, TIOCNXCL);
             close((int)oldFd);
+            haveOriginalSettings = false;
 #endif
         }
+
+#ifndef _WIN32
+        if (inUseLockFd != -1)
+        {
+            close(inUseLockFd);
+            inUseLockFd = -1;
+        }
+#endif
 
         /* Clear the receive buffer when port is closed to prevent stale data from
            affecting subsequent reads if the same port is reopened */
@@ -315,6 +390,60 @@ namespace WandererRotator
             std::lock_guard<std::mutex> lock(rxMutex);
             rxBuffer.clear();
         }
+    }
+
+    void SerialPort::MarkInUse(const char *portName)
+    {
+#ifndef _WIN32
+        if (fd == -1 || inUseLockFd != -1)
+        {
+            return;
+        }
+
+        /* Readable by everyone: other users' scans only need to test the lock */
+        std::string path = InUseMarkerPath(portName);
+        int lockFd = open(path.c_str(), O_RDONLY | O_CREAT | O_CLOEXEC, 0644);
+        if (lockFd < 0)
+        {
+            WR_DEBUG("SerialPort::MarkInUse: cannot create %s (errno=%d)", path.c_str(), errno);
+            return;
+        }
+        if (flock(lockFd, LOCK_EX | LOCK_NB) != 0)
+        {
+            WR_DEBUG("SerialPort::MarkInUse: %s already locked (errno=%d)", path.c_str(), errno);
+            close(lockFd);
+            return;
+        }
+        inUseLockFd = lockFd;
+#else
+        (void)portName;
+#endif
+    }
+
+    void SerialPort::RestoreOriginalSettings()
+    {
+#ifndef _WIN32
+        if (fd != -1 && haveOriginalSettings)
+        {
+            struct termios settings = originalSettings;
+            settings.c_cflag &= ~HUPCL;
+            tcsetattr((int)fd, TCSANOW, &settings);
+        }
+#endif
+    }
+
+    bool SerialPort::IsHungUp()
+    {
+        if (fd == -1)
+        {
+            return false;
+        }
+#ifdef _WIN32
+        return false;
+#else
+        struct pollfd pfd = {(int)fd, 0, 0};
+        return poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL));
+#endif
     }
 
     bool SerialPort::Write(const unsigned char *data, int len)
@@ -342,6 +471,10 @@ namespace WandererRotator
                 if (errno == EINTR)
                     continue;
                 WR_DEBUG("Write: fd=%d, write failed (errno=%d)", (int)fd, errno);
+                break;
+            }
+            if (n == 0)
+            {
                 break;
             }
             written += (int)n;

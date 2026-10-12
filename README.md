@@ -118,7 +118,37 @@ handshake). Devices already known to the SDK keep their id across rescans.
 - `number` - receives the number of ids written
 
 Registered devices that have been unplugged and are not open are dropped from
-the list (their id becomes invalid).
+the list (their id becomes invalid). Devices are registered under their
+`/dev/serial/by-path/...` link where there is one, so `WRRotatorOpen` reconnects
+after the rotator is unplugged and plugged back into the same socket, even if it
+comes back as a different `/dev/ttyUSBn`.
+
+#### `WRRotatorGetPort(int id, char *port)`
+Get a port name for a scanned device that can be saved and passed to
+`WRRotatorScanPort` later. `port` must hold `WR_PORT_LEN` bytes. This is the
+device's `/dev/serial/by-path/...` link, which stays the same across reconnects
+and reboots as long as the rotator is plugged into the same USB socket (or its
+device node if there is no such link). The CH340 has no USB serial number, so
+`/dev/serial/by-id/...` is the same for every CH340 device and cannot be used.
+
+#### `WRRotatorScanPort(const char *port, int *id)`
+Probe only the given port instead of every CH340 port, so devices of other
+programs are not touched. `id` receives the device id. A port that already
+belongs to a registered device returns that device's id without probing it again.
+The device keeps the port name it was found on, so with a by-path link
+`WRRotatorOpen` reconnects after a replug the same way as for `WRRotatorScan`.
+If nothing on the port is a CH340 or no rotator answers there, it returns
+`WR_ERROR_COMMUNICATION`; fall back to `WRRotatorScan`:
+
+```c
+int id, count, ids[WR_MAX_NUM];
+if (WRRotatorScanPort(savedPort, &id) != WR_SUCCESS) {
+    if (WRRotatorScan(&count, ids) != WR_SUCCESS || count == 0)
+        return -1;
+    id = ids[0];
+}
+WRRotatorGetPort(id, savedPort);   /* remember for next time */
+```
 
 #### `WRRotatorOpen(int id)` / `WRRotatorClose(int id)`
 Open or close the serial connection to a scanned device. Closing does not stop a
@@ -133,13 +163,28 @@ Moves run in the background. While one is in progress, `WRRotatorMove`,
 `WRRotatorSetConfig` (reverse direction or backlash) wait for it to finish
 before running. `WRRotatorStopMove`, `WRRotatorClose` and the `Get` functions
 never wait. Calls that need an open device return `WR_ERROR_INVALID_STATE`
-when it is not open.
+when it is not open. If the USB connection of an open device is lost, calls
+return `WR_ERROR_COMMUNICATION` until `WRRotatorOpen` reconnects it.
+
+Numbers are exchanged with the device in a locale-independent way, so the SDK
+works in applications that use a decimal comma (e.g. German locales).
+
+Scanning probes every CH340 serial port. Ports that another program holds
+exclusively (TIOCEXCL or an advisory lock) are skipped once they stay busy;
+ports that turn out not to be a rotator get their previous settings back.
+
+While a device is open, the SDK holds an advisory lock (`flock`) on
+`/tmp/ch34x-<port>.lock` (e.g. `/tmp/ch34x-ttyUSB0.lock`). Scans that find a
+port busy check this marker: if it is held the port is in use and is skipped at
+once, otherwise it is assumed to be briefly probed by another scan and waited
+for (up to 6 s). Other SDKs for CH34x-based devices can follow the same
+convention so that scans of all of them skip ports in use.
 
 ### Configuration
 
 #### `WRRotatorGetConfig(int id, WR_ROTATOR_CONFIG *config)`
 #### `WRRotatorSetConfig(int id, const WR_ROTATOR_CONFIG *config)`
-`config->mask` selects which fields `WRRotatorSetConfig` applies
+`WRRotatorGetConfig` sets `config->mask` to 0. `config->mask` selects which fields `WRRotatorSetConfig` applies
 (`MASK_ROTATOR_REVERSE_DIRECTION`, `MASK_ROTATOR_BACKLASH`, `MASK_ROTATOR_OVERSHOOT`,
 `MASK_ROTATOR_OVERSHOOT_ANGLE`, `MASK_ROTATOR_OVERSHOOT_DIRECTION`, or
 `MASK_ROTATOR_ALL`). All selected fields are validated before anything is sent to
@@ -202,4 +247,4 @@ For issues, questions, or suggestions, please open an issue on the project repos
 
 ---
 
-**Version:** 1.5.0
+**Version:** 1.6.0

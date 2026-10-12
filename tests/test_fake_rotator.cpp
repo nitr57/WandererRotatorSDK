@@ -34,6 +34,7 @@
 #include "WandererRotatorDevice.h"
 #include "WandererRotatorProtocol.h"
 #include <atomic>
+#include <locale.h>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -44,7 +45,9 @@
 #include <poll.h>
 #include <string>
 #include <sys/resource.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <clocale>
 #include <termios.h>
 #include <thread>
 #include <unistd.h>
@@ -231,6 +234,8 @@ struct FakeRotator
 
     void Loop()
     {
+        /* The firmware always uses '.', whatever locale the test sets */
+        uselocale(newlocale(LC_ALL_MASK, "C", (locale_t)0));
         std::string acc;
         auto lastByte = steady_clock::now();
         while (run)
@@ -532,13 +537,81 @@ static void TestUnplug()
     std::this_thread::sleep_for(milliseconds(100));
     double cpuStart = CpuSeconds();
     fake.Hangup();
-    bool idle = WaitIdle(id, 6000);
+    std::this_thread::sleep_for(milliseconds(500));
+    WR_ROTATOR_STATUS s = {};
+    CHECK(WRRotatorGetStatus(id, &s) == WR_ERROR_COMMUNICATION, "GetStatus reports the lost connection");
+    WR_VERSION v = {};
+    CHECK(WRRotatorGetVersion(id, &v) == WR_ERROR_COMMUNICATION, "GetVersion reports the lost connection");
+    CHECK(WRRotatorMove(id, 1.0f) == WR_ERROR_COMMUNICATION, "Move reports the lost connection");
     double cpu = CpuSeconds() - cpuStart;
-    CHECK(idle, "moving cleared after unplug");
     CHECK(cpu < 1.0, "no busy loop while waiting (%.2fs CPU)", cpu);
     auto start = steady_clock::now();
+    CHECK(WRRotatorOpen(id) == WR_ERROR_COMMUNICATION, "reopening a vanished port fails instead of claiming success");
+    CHECK(ElapsedMs(start) < 12000, "reopen attempt took %ld ms", ElapsedMs(start));
+    start = steady_clock::now();
     WRRotatorClose(id);
     CHECK(ElapsedMs(start) < 2000, "Close after unplug took %ld ms", ElapsedMs(start));
+}
+
+static void TestCommaLocale()
+{
+    if (!setlocale(LC_ALL, "en_DK.utf8") && !setlocale(LC_ALL, "de_DE.UTF-8"))
+    {
+        printf("  SKIP  no comma-decimal locale installed\n");
+        return;
+    }
+    char buf[16];
+    snprintf(buf, sizeof buf, "%.1f", 1.5);
+    CHECK(strcmp(buf, "1,5") == 0, "host locale uses a decimal comma (%s)", buf);
+    {
+        FakeRotator fake;
+        int id = AddDevice(fake);
+        CHECK(WRRotatorOpen(id) == WR_SUCCESS, "open under a comma locale");
+        WR_ROTATOR_CONFIG c = {};
+        c.mask = MASK_ROTATOR_OVERSHOOT | MASK_ROTATOR_OVERSHOOT_ANGLE;
+        c.overshoot = 1;
+        c.overshootAngle = 2.0f;
+        WRRotatorSetConfig(id, &c);
+        WRRotatorMove(id, 10.5f);
+        CHECK(WaitIdle(id, 3000), "move completes");
+        CHECK(fabsf(Status(id).position - 100.5f) < 0.05f, "position %.3f ~ 100.5", Status(id).position);
+        WRRotatorClose(id);
+    }
+    setlocale(LC_ALL, "C");
+}
+
+static bool ProbeLikeScan(FakeRotator &fake, long &elapsedMs);
+
+static void TestProbeLeavesOtherProgramsAlone()
+{
+    {
+        /* Another program has the port open at 115200 without locking it */
+        FakeRotator fake;
+        fake.bootMs = 60000; /* not a rotator: never answers */
+        int other = open(fake.slavePath.c_str(), O_RDWR | O_NOCTTY);
+        struct termios t;
+        tcgetattr(other, &t);
+        cfsetispeed(&t, B115200);
+        cfsetospeed(&t, B115200);
+        tcsetattr(other, TCSANOW, &t);
+        long ms;
+        CHECK(!ProbeLikeScan(fake, ms), "port probed and rejected");
+        tcgetattr(other, &t);
+        CHECK(cfgetospeed(&t) == B115200, "the other program's baud rate was restored");
+        close(other);
+    }
+    {
+        /* Another program holds an exclusive advisory lock (e.g. pyserial exclusive=True) */
+        FakeRotator fake;
+        int other = open(fake.slavePath.c_str(), O_RDWR | O_NOCTTY);
+        flock(other, LOCK_EX);
+        SerialPort port;
+        port.SetRetryParams(4, 100);
+        auto start = steady_clock::now();
+        CHECK(!port.Open(fake.slavePath.c_str()), "locked port treated as busy (%ld ms)", ElapsedMs(start));
+        CHECK(fake.Cmds().empty(), "nothing sent to the locked port");
+        close(other);
+    }
 }
 
 static void TestGarbledReply()
@@ -689,8 +762,13 @@ static bool ProbeLikeScan(FakeRotator &fake, long &elapsedMs)
     device->portName = fake.slavePath;
     device->port = std::make_shared<SerialPort>();
     auto start = steady_clock::now();
-    bool ok = device->port->Open(fake.slavePath.c_str()) && ProbeStatus(device) == WR_SUCCESS;
+    bool opened = device->port->Open(fake.slavePath.c_str());
+    bool ok = opened && ProbeStatus(device) == WR_SUCCESS;
     elapsedMs = ElapsedMs(start);
+    if (opened && !ok)
+    {
+        device->port->RestoreOriginalSettings();
+    }
     device->port->Close();
     return ok;
 }
@@ -716,6 +794,41 @@ static void TestScanProbe()
     }
 }
 
+static void TestInUseMarker()
+{
+    FakeRotator fake;
+    std::string name = fake.slavePath.substr(fake.slavePath.rfind('/') + 1);
+    std::string marker = "/tmp/ch34x-" + name + ".lock";
+
+    SerialPort user;
+    CHECK(user.Open(fake.slavePath.c_str()), "port opened by a user");
+
+    /* Open but not marked: busy because it is being probed - worth waiting for */
+    SerialPort other;
+    other.SetRetryParams(4, 100);
+    auto start = steady_clock::now();
+    CHECK(!other.Open(fake.slavePath.c_str()) && ElapsedMs(start) >= 350, "unmarked busy port waited for (%ld ms)", ElapsedMs(start));
+
+    /* Marked in use: will not become free soon - skipped at once */
+    user.MarkInUse(fake.slavePath.c_str());
+    CHECK(access(marker.c_str(), F_OK) == 0, "marker %s created", marker.c_str());
+    other.SetRetryParams(120, 50);
+    start = steady_clock::now();
+    CHECK(!other.Open(fake.slavePath.c_str()) && ElapsedMs(start) < 300, "port in use skipped in %ld ms instead of 6 s", ElapsedMs(start));
+
+    /* Released on close */
+    user.Close();
+    CHECK(other.Open(fake.slavePath.c_str()), "port free again after the user closed it");
+    other.Close();
+
+    /* WRRotatorOpen marks the port */
+    int id = AddDevice(fake);
+    CHECK(WRRotatorOpen(id) == WR_SUCCESS, "open through the SDK");
+    start = steady_clock::now();
+    CHECK(!other.Open(fake.slavePath.c_str()) && ElapsedMs(start) < 300, "SDK-opened port skipped in %ld ms", ElapsedMs(start));
+    WRRotatorClose(id);
+}
+
 static void TestVersion()
 {
     char buf[64];
@@ -723,6 +836,92 @@ static void TestVersion()
     WRGetSDKVersion(buf);
     size_t len = strlen(buf);
     CHECK(len < sizeof(buf) - 1 && buf[len + 1] == 'x', "writes only the version string (\"%s\")", buf);
+}
+
+static void TestScanPort()
+{
+    /* Earlier tests leave devices registered on /dev/pts/N, and pty numbers
+     * are reused */
+    {
+        std::lock_guard<std::mutex> lock(g_globalMutex);
+        g_devices.clear();
+    }
+
+    int id = -1;
+    CHECK(WRRotatorScanPort(nullptr, &id) == WR_ERROR_NULL_POINTER, "null port rejected");
+    CHECK(WRRotatorScanPort("/dev/serial/by-path/does-not-exist", &id) == WR_ERROR_COMMUNICATION,
+          "missing port reported as communication error");
+
+    /* A pty is not a CH340 - stands in for a foreign device now plugged into
+     * the remembered socket */
+    FakeRotator other;
+    CHECK(WRRotatorScanPort(other.slavePath.c_str(), &id) == WR_ERROR_COMMUNICATION, "non-CH340 port rejected");
+    std::this_thread::sleep_for(milliseconds(100));
+    CHECK(other.Cmds().empty(), "nothing sent to it (%zu commands)", other.Cmds().size());
+
+    FakeRotator fake;
+    int registered = AddDevice(fake);
+    CHECK(WRRotatorScanPort(fake.slavePath.c_str(), &id) == WR_SUCCESS && id == registered,
+          "registered port keeps its id (%d == %d)", id, registered);
+    CHECK(fake.Cmds().empty(), "registered port not probed again");
+
+    char port[WR_PORT_LEN];
+    CHECK(WRRotatorGetPort(registered, port) == WR_SUCCESS && fake.slavePath == port,
+          "GetPort falls back to the device node without a by-path link (%s)", port);
+    CHECK(WRRotatorGetPort(registered, nullptr) == WR_ERROR_NULL_POINTER, "GetPort null buffer rejected");
+    CHECK(WRRotatorGetPort(-1, port) == WR_ERROR_INVALID_ID, "GetPort invalid id rejected");
+}
+
+/* A device registered on a link (as WRRotatorScanPort registers a
+ * /dev/serial/by-path/... link) reconnects to the node the link points to
+ * after a replug, not to the node it had before */
+static void TestReconnectViaLink()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_globalMutex);
+        g_devices.clear();
+    }
+
+    char dir[] = "/tmp/wr-link-XXXXXX";
+    CHECK(mkdtemp(dir) != nullptr, "temp dir");
+    std::string link = std::string(dir) + "/by-path-port0";
+
+    FakeRotator before;
+    FakeRotator after; /* created now so it gets a different /dev/pts/N */
+    symlink(before.slavePath.c_str(), link.c_str());
+
+    auto device = std::make_shared<Device>();
+    device->portName = link;
+    int id;
+    {
+        std::lock_guard<std::mutex> lock(g_globalMutex);
+        g_devices[0] = device;
+        id = 0;
+    }
+
+    CHECK(WRRotatorOpen(id) == WR_SUCCESS, "open via link");
+    before.Hangup();
+
+    /* Replugged: udev points the link to the new node */
+    unlink(link.c_str());
+    symlink(after.slavePath.c_str(), link.c_str());
+    size_t sent = after.Cmds().size();
+    CHECK(WRRotatorOpen(id) == WR_SUCCESS, "reopen follows the link to %s", after.slavePath.c_str());
+    CHECK(after.Cmds().size() > sent, "handshake went to the new node");
+
+    int found = -1;
+    CHECK(WRRotatorScanPort(after.slavePath.c_str(), &found) == WR_SUCCESS && found == id,
+          "the new node is recognized as the registered device (%d == %d)", found, id);
+    found = -1;
+    CHECK(WRRotatorScanPort(link.c_str(), &found) == WR_SUCCESS && found == id,
+          "so is the link (%d == %d)", found, id);
+
+    char port[WR_PORT_LEN];
+    CHECK(WRRotatorGetPort(id, port) == WR_SUCCESS && link == port, "GetPort returns the link (%s)", port);
+
+    WRRotatorClose(id);
+    unlink(link.c_str());
+    rmdir(dir);
 }
 
 int main(int argc, char **argv)
@@ -753,7 +952,12 @@ int main(int argc, char **argv)
         {"not-open", TestNotOpen},
         {"permission", TestPermissionDenied},
         {"scan-probe", TestScanProbe},
+        {"comma-locale", TestCommaLocale},
+        {"other-programs", TestProbeLeavesOtherProgramsAlone},
+        {"in-use-marker", TestInUseMarker},
         {"version", TestVersion},
+        {"scan-port", TestScanPort},
+        {"reconnect-via-link", TestReconnectViaLink},
     };
 
     const char *only = argc > 1 ? argv[1] : nullptr;

@@ -27,9 +27,32 @@
 
 #include "WandererRotatorSDK.h"
 #include "WandererRotatorDevice.h"
+#include <locale.h>
 
 namespace WandererRotator
 {
+    /**
+     * While in scope, numeric conversions on this thread (sscanf/snprintf %f)
+     * use '.' as the decimal separator, like the device does - whatever
+     * LC_NUMERIC the host application has set (e.g. "," with a German locale).
+     */
+    class ClassicNumericLocale
+    {
+    public:
+        ClassicNumericLocale() : previous(uselocale(Classic())) {}
+        ~ClassicNumericLocale() { uselocale(previous); }
+        ClassicNumericLocale(const ClassicNumericLocale &) = delete;
+        ClassicNumericLocale &operator=(const ClassicNumericLocale &) = delete;
+
+    private:
+        static locale_t Classic()
+        {
+            static locale_t classic = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+            return classic;
+        }
+        locale_t previous;
+    };
+
     /**
      * Send a command to the device, discarding any unread input first.
      * Caller must hold device->ioMutex (or own the port as the listener).

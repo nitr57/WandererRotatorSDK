@@ -49,7 +49,7 @@
 #include <dirent.h>
 #include <libudev.h>
 
-#define SDK_VERSION "1.5.0"
+#define SDK_VERSION "1.6.0"
 
 /* Import internal implementation for use in public C API */
 using namespace WandererRotator;
@@ -89,6 +89,13 @@ static std::shared_ptr<Device> FindDevice(int id)
     std::lock_guard<std::mutex> lock(g_globalMutex);
     auto it = g_devices.find(id);
     return it == g_devices.end() ? nullptr : it->second;
+}
+
+/* True if the device was opened but its port has since been hung up, e.g.
+ * because the USB cable was unplugged. Such a device must be reopened. */
+static bool ConnectionLost(const std::shared_ptr<Device> &device)
+{
+    return device->isOpen && device->port && device->port->IsHungUp();
 }
 
 /* Waits until no move is in progress on this device, then returns holding its
@@ -243,6 +250,63 @@ static WR_ERROR_TYPE MoveInternalLocked(std::shared_ptr<Device> device, float an
     return WR_SUCCESS;
 }
 
+/* The device node a port name currently points to. A device registered by
+ * WRRotatorScanPort keeps the /dev/serial/by-path/... link it was found on,
+ * which after a reconnect may point to a different node - compare ports only
+ * through this. Returns the name unchanged if it does not exist (unplugged). */
+static std::string ResolvePort(const std::string &port)
+{
+    char resolved[PATH_MAX];
+    return realpath(port.c_str(), resolved) ? std::string(resolved) : port;
+}
+
+/* True if the tty belongs to a CH340 USB-serial chip (1a86:7523), the one
+ * the rotator uses */
+static bool IsCh340(struct udev_device *tty)
+{
+    struct udev_device *parent = udev_device_get_parent_with_subsystem_devtype(
+        tty, "usb", "usb_device");
+    if (!parent)
+    {
+        return false;
+    }
+
+    const char *vid = udev_device_get_sysattr_value(parent, "idVendor");
+    const char *pid = udev_device_get_sysattr_value(parent, "idProduct");
+    return vid && pid && strcmp(vid, "1a86") == 0 && strcmp(pid, "7523") == 0;
+}
+
+/* The tty's /dev/serial/by-path/... link, which names the USB socket and so
+ * survives reconnects, or "" if it has none (or none that fits WR_PORT_LEN).
+ * udev lists the links sorted, so the choice is stable. Newer udev versions
+ * add a ...-usbv2-... link next to the legacy one; either works. */
+static std::string ByPathLink(struct udev_device *tty)
+{
+    struct udev_list_entry *entry;
+    udev_list_entry_foreach(entry, udev_device_get_devlinks_list_entry(tty))
+    {
+        const char *link = udev_list_entry_get_name(entry);
+        if (strncmp(link, "/dev/serial/by-path/", 20) == 0 && strlen(link) < WR_PORT_LEN)
+        {
+            return link;
+        }
+    }
+    return "";
+}
+
+/* Registers a newly found device under the smallest free id, so it never
+ * collides with (and silently replaces) an already registered one. Caller
+ * holds g_globalMutex. */
+static int RegisterDevice(const std::shared_ptr<Device> &device)
+{
+    int id = 0;
+    while (g_devices.find(id) != g_devices.end())
+        id++;
+
+    g_devices[id] = device;
+    return id;
+}
+
 /* Structure for parallel device scanning */
 struct ScanWorkerTask
 {
@@ -281,6 +345,9 @@ try
 
     if(stat != WR_SUCCESS)
     {
+        /* Not a rotator - possibly another program's device: leave its port
+         * settings as we found them */
+        port->RestoreOriginalSettings();
         port->Close();
         return;
     }
@@ -297,6 +364,10 @@ catch (const std::exception &e)
 {
     /* An exception escaping a std::thread would call std::terminate */
     WR_ERROR("ScanWorkerThread: unexpected exception on %s: %s", task.portName.c_str(), e.what());
+}
+catch (...)
+{
+    WR_ERROR("ScanWorkerThread: unexpected exception on %s", task.portName.c_str());
 }
 
 /* ============================================================================
@@ -341,7 +412,7 @@ try
         {
             if (!pair.second->portName.empty())
             {
-                connectedPorts[pair.second->portName] = pair.first;
+                connectedPorts[ResolvePort(pair.second->portName)] = pair.first;
             }
         }
     }
@@ -368,8 +439,11 @@ try
     struct udev_list_entry *devices = udev_enumerate_get_list_entry(enumerate.get());
     struct udev_list_entry *entry;
 
-    /* Step 1: Collect all candidate CH340 devices */
+    /* Step 1: Collect all candidate CH340 devices. Ports are compared by
+     * device node, but a device is registered under its by-path link if it
+     * has one, so WRRotatorOpen can reconnect after a replug. */
     std::vector<std::string> candidatePorts;
+    std::map<std::string, std::string> portNames; /* device node -> name to register */
     udev_list_entry_foreach(entry, devices)
     {
         const char *path = udev_list_entry_get_name(entry);
@@ -380,25 +454,7 @@ try
             continue;
         }
 
-        /* Get the parent USB device */
-        struct udev_device *parent = udev_device_get_parent_with_subsystem_devtype(
-            device.get(), "usb", "usb_device");
-
-        if (!parent)
-        {
-            continue;
-        }
-
-        /* Check VID and PID for CH340 (1a86:7523) */
-        const char *vid = udev_device_get_sysattr_value(parent, "idVendor");
-        const char *pid = udev_device_get_sysattr_value(parent, "idProduct");
-
-        if (!vid || !pid)
-        {
-            continue;
-        }
-
-        if (strcmp(vid, "1a86") != 0 || strcmp(pid, "7523") != 0)
+        if (!IsCh340(device.get()))
         {
             continue;
         }
@@ -407,8 +463,10 @@ try
         const char *deviceNode = udev_device_get_devnode(device.get());
         if (deviceNode)
         {
-            WR_DEBUG("Found CH340 device: %s", deviceNode);
+            std::string link = ByPathLink(device.get());
+            WR_DEBUG("Found CH340 device: %s (%s)", deviceNode, link.empty() ? "no by-path link" : link.c_str());
             candidatePorts.push_back(std::string(deviceNode));
+            portNames[deviceNode] = link.empty() ? std::string(deviceNode) : link;
         }
     }
 
@@ -423,7 +481,7 @@ try
             continue;
         if ((int)tasks.size() >= WR_MAX_NUM)
             break;
-        tasks.emplace_back(port.c_str());
+        tasks.emplace_back(portNames[port].c_str());
     }
 
     /* Spawn worker threads for each candidate port */
@@ -462,7 +520,7 @@ try
     for (auto it = g_devices.begin(); it != g_devices.end();)
     {
         bool present = std::find(candidatePorts.begin(), candidatePorts.end(),
-                                 it->second->portName) != candidatePorts.end();
+                                 ResolvePort(it->second->portName)) != candidatePorts.end();
         if (!present && !it->second->isOpen)
         {
             WR_DEBUG("Scan: Device id=%d on %s is gone, removing", it->first, it->second->portName.c_str());
@@ -487,12 +545,7 @@ try
     {
         if (task.isValid && count < WR_MAX_NUM)
         {
-            int id = 0;
-            while (g_devices.find(id) != g_devices.end())
-                id++;
-
-            g_devices[id] = task.device;
-            ids[count] = id;
+            ids[count] = RegisterDevice(task.device);
             count++;
         }
     }
@@ -500,6 +553,118 @@ try
     *number = count;
 
     WR_INFO("Scan complete: found %d device(s)", count);
+    return WR_SUCCESS;
+}
+WR_API_CATCH
+
+WRAPI WR_ERROR_TYPE WRRotatorScanPort(const char *port, int *id)
+try
+{
+    WR_INFO("Scanning port %s", port ? port : "(null)");
+    if (!port || !id)
+    {
+        WR_ERROR("Invalid pointer parameters");
+        return WR_ERROR_NULL_POINTER;
+    }
+
+    std::lock_guard<std::mutex> scanLock(g_scanMutex);
+
+    /* Compare device nodes: the registered device may have been found by
+     * WRRotatorScan (node) or on a /dev/serial/by-path/... link */
+    char resolved[PATH_MAX];
+    if (!realpath(port, resolved))
+    {
+        WR_DEBUG("WRRotatorScanPort: %s does not exist", port);
+        return WR_ERROR_COMMUNICATION;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_globalMutex);
+        for (const auto &pair : g_devices)
+        {
+            if (ResolvePort(pair.second->portName) == resolved)
+            {
+                *id = pair.first;
+                return WR_SUCCESS;
+            }
+        }
+    }
+
+    /* A by-path link names a USB socket, not a device: if something else is
+     * plugged in there now, leave it alone */
+    std::unique_ptr<struct udev, decltype(&udev_unref)> udev(udev_new(), &udev_unref);
+    if (!udev)
+    {
+        return WR_ERROR_COMMUNICATION;
+    }
+
+    const char *name = strrchr(resolved, '/');
+    std::unique_ptr<struct udev_device, decltype(&udev_device_unref)> tty(
+        udev_device_new_from_subsystem_sysname(udev.get(), "tty", name ? name + 1 : resolved),
+        &udev_device_unref);
+    if (!tty || !IsCh340(tty.get()))
+    {
+        WR_DEBUG("WRRotatorScanPort: %s is not a CH340 port", resolved);
+        return WR_ERROR_COMMUNICATION;
+    }
+
+    /* Keep the name as given: a by-path link then follows the rotator to
+     * whatever node it gets after a reconnect in the same socket, so
+     * WRRotatorOpen can reconnect without a rescan */
+    ScanWorkerTask task(port);
+    ScanWorkerThread(task);
+    if (!task.isValid)
+    {
+        WR_DEBUG("WRRotatorScanPort: No rotator on %s", resolved);
+        return WR_ERROR_COMMUNICATION;
+    }
+
+    std::lock_guard<std::mutex> lock(g_globalMutex);
+    *id = RegisterDevice(task.device);
+
+    WR_INFO("Scan complete: found rotator on %s (id=%d)", port, *id);
+    return WR_SUCCESS;
+}
+WR_API_CATCH
+
+WRAPI WR_ERROR_TYPE WRRotatorGetPort(int id, char *port)
+try
+{
+    if (!port)
+    {
+        return WR_ERROR_NULL_POINTER;
+    }
+
+    auto device = FindDevice(id);
+    if (!device)
+    {
+        return WR_ERROR_INVALID_ID;
+    }
+
+    std::string result = device->portName;
+
+    /* Found on a by-path link already: that is the name to keep. Otherwise
+     * (registered by device node, e.g. WRRotatorScanPort("/dev/ttyUSB0"))
+     * look the link up. */
+    std::string node = ResolvePort(device->portName);
+    std::unique_ptr<struct udev, decltype(&udev_unref)> udev(udev_new(), &udev_unref);
+    const char *name = strrchr(node.c_str(), '/');
+    if (result.rfind("/dev/serial/by-path/", 0) != 0 && udev && name)
+    {
+        std::unique_ptr<struct udev_device, decltype(&udev_device_unref)> tty(
+            udev_device_new_from_subsystem_sysname(udev.get(), "tty", name + 1), &udev_device_unref);
+        std::string link = tty ? ByPathLink(tty.get()) : "";
+        if (!link.empty())
+        {
+            result = link;
+        }
+    }
+
+    if (result.size() >= WR_PORT_LEN)
+    {
+        return WR_ERROR_INVALID_STATE;
+    }
+    memcpy(port, result.c_str(), result.size() + 1);
     return WR_SUCCESS;
 }
 WR_API_CATCH
@@ -522,10 +687,21 @@ try
      * must not block calls on other devices. */
     std::lock_guard<std::mutex> io(device->ioMutex);
 
-    if (device->isOpen)
+    if (device->isOpen && !device->port->IsHungUp())
     {
         WR_DEBUG("WRRotatorOpen: Device already open");
         return WR_SUCCESS;
+    }
+
+    if (device->isOpen)
+    {
+        /* The connection was lost (e.g. USB unplugged and plugged back in):
+         * drop the dead port and open it again */
+        WR_ERROR("WRRotatorOpen: Connection to %s was lost, reopening", device->portName.c_str());
+        StopMoveListener(device);
+        device->port->Close();
+        device->isOpen = false;
+        SetMoving(device.get(), false);
     }
 
     /* Create a new SerialPort instance if needed */
@@ -563,6 +739,10 @@ try
         device->port->Close();
         return WR_ERROR_COMMUNICATION;
     }
+
+    /* Lets other programs' scans skip this port at once instead of waiting
+     * for it to become free */
+    device->port->MarkInUse(device->portName.c_str());
 
     device->isOpen = true;
 
@@ -621,7 +801,13 @@ try
         return WR_ERROR_INVALID_ID;
     }
 
+    if (ConnectionLost(device))
+    {
+        return WR_ERROR_COMMUNICATION;
+    }
+
     std::lock_guard<std::mutex> lock(device->stateMutex);
+    config->mask = 0; /* set the bits of the fields to change before passing it to SetConfig */
     config->reverseDirection = device->reverseDirection;
     config->backlash = device->backlash / 10.0f; /* Convert from internal format */
     config->overshoot = device->overshoot;
@@ -670,6 +856,11 @@ try
         if (!device->isOpen)
         {
             return WR_ERROR_INVALID_STATE;
+        }
+
+        if (ConnectionLost(device))
+        {
+            return WR_ERROR_COMMUNICATION;
         }
 
         if (config->mask & MASK_ROTATOR_REVERSE_DIRECTION)
@@ -741,6 +932,11 @@ try
         return WR_ERROR_INVALID_ID;
     }
 
+    if (ConnectionLost(device))
+    {
+        return WR_ERROR_COMMUNICATION;
+    }
+
     /* If currently moving, hardware does not support fetching latest status */
     std::lock_guard<std::mutex> lock(device->stateMutex);
     status->position = device->status.position;
@@ -764,6 +960,11 @@ try
     if (!device)
     {
         return WR_ERROR_INVALID_ID;
+    }
+
+    if (ConnectionLost(device))
+    {
+        return WR_ERROR_COMMUNICATION;
     }
 
     std::lock_guard<std::mutex> lock(device->stateMutex);
@@ -802,6 +1003,11 @@ try
     if (!device->isOpen)
     {
         return WR_ERROR_INVALID_STATE;
+    }
+
+    if (ConnectionLost(device))
+    {
+        return WR_ERROR_COMMUNICATION;
     }
 
     /* Set the current mechanical position as zero (home)
@@ -845,6 +1051,11 @@ try
         return WR_ERROR_INVALID_STATE;
     }
 
+    if (ConnectionLost(device))
+    {
+        return WR_ERROR_COMMUNICATION;
+    }
+
     return MoveInternalLocked(device, angle);
 }
 WR_API_CATCH
@@ -869,6 +1080,11 @@ try
     if (!device->isOpen)
     {
         return WR_ERROR_INVALID_STATE;
+    }
+
+    if (ConnectionLost(device))
+    {
+        return WR_ERROR_COMMUNICATION;
     }
 
     /* Perform status update */
@@ -913,6 +1129,11 @@ try
     if (!device->isOpen)
     {
         return WR_ERROR_INVALID_STATE;
+    }
+
+    if (ConnectionLost(device))
+    {
+        return WR_ERROR_COMMUNICATION;
     }
 
     {

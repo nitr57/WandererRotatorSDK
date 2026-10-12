@@ -175,6 +175,7 @@ namespace WandererRotator
             int angle;
             float backlash;
             int reverse;
+            ClassicNumericLocale numericLocale;
             if (sscanf(response,
                        "WandererRotator%31[^A]A%dA%dA%fA%dA",
                        model,
@@ -371,9 +372,11 @@ namespace WandererRotator
         SetMoving(device, false);
     }
 
-    /* Background listener thread function for movement completion */
-    static void MoveListenerThreadFunc(Device* device)
+    /* Background listener thread body for movement completion */
+    static void MoveListenerThreadBody(Device* device)
     {
+        ClassicNumericLocale numericLocale;
+
         WR_DEBUG("MoveListener: Started for device %s", device->portName.c_str());
 
         char buffer[32];
@@ -428,6 +431,24 @@ namespace WandererRotator
             device->moveDoneCv.notify_all();
         }
         WR_DEBUG("MoveListener: Stopped for device %s", device->portName.c_str());
+    }
+
+    static void MoveListenerThreadFunc(Device* device)
+    {
+        try
+        {
+            MoveListenerThreadBody(device);
+        }
+        catch (...)
+        {
+            /* An exception escaping a std::thread would call std::terminate.
+             * Release callers waiting for the move to finish. */
+            WR_ERROR("MoveListener: unexpected exception, stopping");
+            std::lock_guard<std::mutex> lock(device->stateMutex);
+            device->status.moving = 0;
+            device->listenerRunning = false;
+            device->moveDoneCv.notify_all();
+        }
     }
 
     bool StartMoveListener(std::shared_ptr<Device> device)
